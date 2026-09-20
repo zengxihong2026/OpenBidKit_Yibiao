@@ -533,6 +533,15 @@ function buildKnowledgeFiles(knowledgeBaseService, documentIds) {
   return files;
 }
 
+function compactPromptText(value, maxChars) {
+  const text = String(value || '').trim();
+  const limit = Math.max(0, Number(maxChars) || 0);
+  if (!text || !limit || text.length <= limit) return text;
+  const head = Math.max(1, Math.floor(limit * 0.72));
+  const tail = Math.max(1, limit - head);
+  return `${text.slice(0, head)}\n…（目录阶段上下文已压缩）…\n${text.slice(-tail)}`;
+}
+
 function splitAgentSourceMarkdown(markdown, maxChars = 9000) {
   const source = String(markdown || '').trim();
   if (!source) return [];
