@@ -54,12 +54,12 @@ const CONTENT_PLAN_VERSION = 5;
 const CONTENT_KNOWLEDGE_TOP_K = 3;
 const CONTENT_FACT_TITLE_MAX = 8;
 const CONTENT_PLAN_BATCH_SIZE = 10;
-const CONTENT_PROJECT_OVERVIEW_MAX_CHARS = 4000;
-const CONTENT_SELECTED_FACTS_MAX_CHARS = 8000;
-const CONTENT_TENDER_CONTEXT_MAX_CHARS = 7000;
+const CONTENT_PROJECT_OVERVIEW_MAX_CHARS = 3000;
+const CONTENT_SELECTED_FACTS_MAX_CHARS = 6000;
+const CONTENT_TENDER_CONTEXT_MAX_CHARS = 5000;
 const CONTENT_TENDER_CONTEXT_SNIPPETS = 4;
-const CONTENT_KNOWLEDGE_ITEM_MAX_CHARS = 5000;
-const CONTENT_KNOWLEDGE_TOTAL_MAX_CHARS = 12000;
+const CONTENT_KNOWLEDGE_ITEM_MAX_CHARS = 4000;
+const CONTENT_KNOWLEDGE_TOTAL_MAX_CHARS = 9000;
 const CONSISTENCY_FACT_CONTEXT_MAX_CHARS = 6000;
 const ORIGINAL_COVERAGE_SOURCE_MAX_CHARS = 3000;
 const ORIGINAL_COVERAGE_TOTAL_SOURCE_CHARS = 10000;
@@ -3095,7 +3095,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
   const bidAnalysisFactsText = formatBidAnalysisFactsForPrompt(storedPlan);
   const compactBidKeyInfoText = compactPromptText(
     formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText),
-    5000,
+    4500,
   );
   const isExpansionWorkflow = storedPlan.workflowKind === 'existing-plan-expansion';
   let originalPlanMarkdown = '';
