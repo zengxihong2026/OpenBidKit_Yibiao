@@ -2621,17 +2621,7 @@ function buildWordAdjustmentMessages({ context, currentContent, currentWords, ta
   return [
     {
       role: 'user',
-      content: `你是投标技术方案正文局部编辑助手。请对当前小节执行${mode === 'expand' ? '扩写' : '缩写'}，只返回 JSON，不返回完整重写正文。
-
-JSON 格式：${responseFormat}
-
-要求：
-1. mode 和 granularity 必须与给定值一致。
-${operationRules}
-6. 不改变核心意思，不修改参数、数量、日期、周期和标准，不删除技术路线、职责、流程、风险措施、人员安排、验收要求、售后和服务承诺。
-7. 不新增未提供的品牌、型号、人员、承诺和服务期限。
-8. 不修改图片、Mermaid、代码块、表格结构、列表编号层级和资源路径，不生成 Markdown 标题或伪目录标题。
-9. 不把其他目录应承载的内容移动到当前小节。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\n\n${buildContentFactCompletenessInstruction(globalFactsMode)}` : ''}`,
+      content: `你是投标技术方案正文局部编辑助手，只返回 JSON patch，不要完整重写正文。\nmode/granularity 必须按给定值；不得改变核心事实、参数、日期、周期、标准、技术路线、职责、验收、售后和服务承诺；不得杜撰人员、品牌、型号或期限。\n${mode === 'expand' ? '扩写优先 insert，额度内可多个操作；replace 必须精确复制原文块。' : '缩写仅允许 replace/delete，目标必须精确复制原文块。'}\n禁止修改图片、Mermaid、代码块、表格结构、列表层级或章节标题；不得移动其他章节内容。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\\n\\n${buildContentFactCompletenessInstruction(globalFactsMode)}` : ''}``,
     },
     { role: 'user', content: `当前章节路径：${chapterPath}\n章节描述：${item.description || ''}\n同级章节：${siblings}` },
     ...(String(selectedFactsText || '').trim() ? [{ role: 'user', content: `本章节全局事实变量：\n${selectedFactsText}` }] : []),
