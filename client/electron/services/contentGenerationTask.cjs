@@ -38,7 +38,7 @@ const INTERRUPTED_SECTION_ERROR = '上次生成被中断，请继续生成。';
 const MAX_WORD_ADJUSTMENT_ROUNDS = 3;
 // 全文扩写不限制有效轮数，仅在连续多轮没有增加字数时退出。
 const MAX_EXPANSION_NO_PROGRESS_ROUNDS = 3;
-const TOTAL_WORD_ADJUSTMENT_BATCH_SIZE = 10;
+const TOTAL_WORD_ADJUSTMENT_BATCH_SIZE = 20;
 const DEFAULT_SECTION_WORD_GUIDANCE = 3000;
 const TOTAL_WORD_SHRINK_SECTION_RATIO = 0.25;
 // 生成阶段按全文上限倒推每小节目标字数时使用的折扣系数，预留 AI 系统性偏高的缓冲，降低初稿超量概率。
@@ -58,7 +58,7 @@ const CONTENT_PLAN_VERSION = 5;
 // Token 优化：单个正文小节默认最多注入 3 条知识库正文素材；如需更多内容应通过后续局部补充，而不是把整库上下文带入每次生成。
 const CONTENT_KNOWLEDGE_TOP_K = 3;
 const CONTENT_FACT_TITLE_MAX = 8;
-const CONTENT_PLAN_BATCH_SIZE = 20;
+const CONTENT_PLAN_BATCH_SIZE = 40;
 const CONTENT_PROJECT_OVERVIEW_MAX_CHARS = 2000;
 const CONTENT_SELECTED_FACTS_MAX_CHARS = 4000;
 const CONTENT_TENDER_CONTEXT_MAX_CHARS = 4000;
