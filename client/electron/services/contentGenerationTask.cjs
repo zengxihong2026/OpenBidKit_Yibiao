@@ -1049,7 +1049,7 @@ function buildChapterContentMessages({ chapter, projectOverview, selectedFactsTe
   return messages;
 }
 
-function buildRestoredChapterContentMessages({ chapter, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent, wordControl, generationTarget = 0, globalFactsMode }) {
+function buildRestoredChapterContentMessages({ chapter, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent, wordControl, generationTarget = 0, globalFactsMode }) {
   const messages = buildChapterContentMessages({
     chapter,
     projectOverview,
@@ -3190,11 +3190,9 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
   let storedContentPlans = pruneContentGenerationPlans(fullRegenerate ? {} : storedPlan.contentGenerationPlans, leaves);
   let knowledgeItems = [];
   let allowedKnowledgeItemIds = new Set();
-  if (tenderMarkdown) {
-    log('已启用招标原文局部检索：正文生成仅注入与当前章节相关的片段。');
-  } else {
-    log('未读取到可用招标原文，正文生成继续使用项目概述和 Step02 关键解析结果。');
-  }
+  logs = [...logs, tenderMarkdown
+    ? '已启用招标原文局部检索：正文生成仅注入与当前章节相关的片段。'
+    : '未读取到可用招标原文，正文生成继续使用项目概述和 Step02 关键解析结果。'];
   let knowledgeContentMap = new Map();
   let sections = createInitialSections(leaves, fullRegenerate ? {} : storedPlan.contentGenerationSections);
   const touchedItemIds = new Set(contentRuntime.touched_item_ids);
