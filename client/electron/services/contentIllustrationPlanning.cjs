@@ -107,12 +107,13 @@ function buildIllustrationPlanningContext({ outlineData, sections, options, aiIm
     if (!context) continue;
     const item = itemById.get(sectionId);
     const content = resolveSectionContent(item || {}, sections);
+    const path = `technical-plan/section-${sectionId.replace(/[^A-Za-z0-9._-]/g, '_')}.md`;
+    sectionFiles.push({ path, content });
+    if (candidateChars >= candidateTotalLimit) continue;
     const bounded = content.length > candidateCharLimit
       ? `${content.slice(0, 1050)}\n…（仅规划预览，完整正文按需读取）…\n${content.slice(-250)}`
       : content;
-    if (candidateChars + bounded.length > candidateTotalLimit) break;
-    const path = `technical-plan/section-${sectionId.replace(/[^A-Za-z0-9._-]/g, '_')}.md`;
-    sectionFiles.push({ path, content });
+    if (candidateChars + bounded.length > candidateTotalLimit) continue;
     candidateBlocks.push(`## ${sectionId} ${singleLine(item?.title || context.id)}\n章节描述：${singleLine(item?.description || '')}\n正文预览：\n${bounded}`);
     candidateChars += bounded.length;
   }
