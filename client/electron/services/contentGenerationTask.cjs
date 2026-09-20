@@ -44,7 +44,9 @@ const ORIGINAL_COVERAGE_REPAIR_MAX_ATTEMPTS = 2;
 const TABLE_CLEANUP_CONTEXT_CHARS = 600;
 const TABLE_CLEANUP_BATCH_CHAR_LIMIT = 30000;
 const CONTENT_GENERATION_PAUSED = 'CONTENT_GENERATION_PAUSED';
-const CONTENT_PLAN_VERSION = 4;
+const CONTENT_PLAN_VERSION = 5;
+// Token 优化：单个正文小节默认最多注入 3 条知识库正文素材；如需更多内容应通过后续局部补充，而不是把整库上下文带入每次生成。\nconst CONTENT_KNOWLEDGE_TOP_K = 3;
+const CONTENT_FACT_TITLE_MAX = 8;
 const TABLE_REQUIREMENT_LABELS = {
   none: '不要',
   light: '少量',
@@ -585,10 +587,10 @@ function normalizeContentPlan(value, allowedKnowledgeItemIds, allowedFactTitles)
   return {
     writing_focus: singleLine(source.writing_focus || source.writingFocus || writing.focus || writing.writing_focus || writing.writingFocus),
     knowledge: {
-      item_ids: normalizeKnowledgeItemIds(rawKnowledgeItemIds, allowedKnowledgeItemIds),
+      item_ids: normalizeKnowledgeItemIds(rawKnowledgeItemIds, allowedKnowledgeItemIds).slice(0, CONTENT_KNOWLEDGE_TOP_K),
     },
     facts: {
-      titles: normalizeFactTitles(rawFactTitles, allowedFactTitles),
+      titles: normalizeFactTitles(rawFactTitles, allowedFactTitles).slice(0, CONTENT_FACT_TITLE_MAX),
     },
     table: {
       needed: tableNeeded,
