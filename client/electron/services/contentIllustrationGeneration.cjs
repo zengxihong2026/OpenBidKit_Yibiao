@@ -20,6 +20,16 @@ function singleLine(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function compactIllustrationReference(value, maxChars = 24000) {
+  const text = String(value || '').trim();
+  if (!text || text.length <= maxChars) return text;
+  const head = Math.max(1, Math.floor(maxChars * 0.72));
+  const tail = Math.max(1, maxChars - head);
+  return `${text.slice(0, head)}
+…（配图参考正文已压缩，仅保留首尾关键上下文）…
+${text.slice(-tail)}`;
+}
+
 function compactError(value, maxLength = 220) {
   const text = singleLine(value);
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
@@ -49,12 +59,23 @@ function validateHtmlCode(value) {
 
 // 从最终正文中构建图片生成参考材料。
 function buildIllustrationReference(planItem, contextById, sections) {
-  return planItem.section_ids.map((sectionId) => {
+  const blocks = [];
+  let totalChars = 0;
+  for (const sectionId of planItem.section_ids || []) {
     const context = contextById.get(sectionId);
     const item = context?.item || {};
-    const content = String(sections?.[sectionId]?.content || item.content || '').trim();
-    return `## ${sectionId} ${singleLine(item.title || '未命名章节')}\n\n${content}`;
-  }).join('\n\n');
+    const content = compactIllustrationReference(
+      String(sections?.[sectionId]?.content || item.content || '').trim(),
+      9000,
+    );
+    if (!content) continue;
+    const remaining = 24000 - totalChars;
+    if (remaining <= 0) break;
+    const bounded = content.length > remaining ? compactIllustrationReference(content, remaining) : content;
+    blocks.push(`## ${sectionId} ${singleLine(item.title || '未命名章节')}\n\n${bounded}`);
+    totalChars += bounded.length;
+  }
+  return blocks.join('\n\n');
 }
 
 function buildIllustrationExecutionContexts(plan, leafContexts, sections) {
