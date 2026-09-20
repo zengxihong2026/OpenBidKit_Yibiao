@@ -419,7 +419,7 @@ async function runGlobalFactsTaskV2({
     ...tenderFiles,
     { path: '招标知识快照.md', content: tenderKnowledgeText || '未生成结构化招标知识快照。' },
     { path: '项目概述.md', content: String(storedPlan.projectOverview || '').trim() || '未提供项目概述。' },
-    { path: '招标解析结果.md', content: formatBidAnalysisFactsForPrompt(storedPlan) },
+    { path: '招标解析结果.md', content: compactKnowledgeItemContent(formatBidAnalysisFactsForPrompt(storedPlan), 10000) },
     { path: '技术方案目录.md', content: formatOutlineForPrompt(outlineData.outline || []) },
   ];
   if (sectionHint) {
