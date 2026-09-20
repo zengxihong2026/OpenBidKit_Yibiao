@@ -1,6 +1,7 @@
 const crypto = require('node:crypto');
 
 const MAX_LEDGER_ENTRIES = 5000;
+const MAX_CONTEXT_HASH_ENTRIES = 2000;
 
 const STAGE_RULES = [
   { stage: 'tender-analysis', patterns: ['step02', '招标解析', '投标解析', '评分点解析', '废标', '资格'] },
@@ -206,6 +207,10 @@ function recordTokenUsageEvent(meta = {}, usage = null, outcome = {}) {
     contextAggregate.last_seen = entry.timestamp;
     contextAggregate.stages[entry.stage] = (contextAggregate.stages[entry.stage] || 0) + 1;
     ledger.by_context_hash[entry.context_hash] = contextAggregate;
+    const contextKeys = Object.keys(ledger.by_context_hash);
+    if (contextKeys.length > MAX_CONTEXT_HASH_ENTRIES) {
+      delete ledger.by_context_hash[contextKeys[0]];
+    }
   }
 
   ledger.entries.push(entry);
