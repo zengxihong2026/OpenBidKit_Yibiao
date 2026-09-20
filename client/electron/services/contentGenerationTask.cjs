@@ -1310,7 +1310,7 @@ function buildAgentOriginalMaterialRestoreFiles({ targets, originalSegments, pro
     {
       path: 'context.md',
       content: `# 招标文件关键信息
-${formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText)}
+${compactPromptText(formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText), 4500)}
 
 # Step04 全局事实变量标题清单
 ${globalFactTitlesText || '未提供'}`,
