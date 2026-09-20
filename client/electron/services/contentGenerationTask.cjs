@@ -1256,6 +1256,7 @@ function buildAgentRestoredChapterContentPrompt(globalFactsMode) {
 
 workspace 文件：
 - chapter-context.md：当前章节信息、项目概述、本章节全局事实变量、用户额外要求和正文编排决策。
+- tender-context.md：与当前章节最相关的招标文件原文片段，如无则为“无”。
 - restored-content.md：已还原正文底稿。
 - knowledge-contents.md：可参考的正文素材，如无则为“无”。
 
@@ -1264,7 +1265,8 @@ workspace 文件：
 2. 必须保留底稿中的实质信息、技术路线、服务承诺、设备参数、人员安排、周期、验收、售后和实施方法。
 3. 可以调整语序、合并重复表达、提升专业性、补充细节、增加过渡和说明，让正文更完整、更适合投标文件。
 4. 结合 chapter-context.md 中的项目概述、全局事实变量和正文编排决策；如存在冲突，以全局事实变量为准。
-5. 可以吸收 knowledge-contents.md 中适合当前章节的技术素材，但不要提到“知识库”“历史文档”“参考资料”或素材来源。
+5. 结合 tender-context.md 中与当前章节直接相关的招标原文要求，优先响应其中的资格、参数、工期、验收、服务、合同等约束，但不要整段照抄招标原文。
+6. 可以吸收 knowledge-contents.md 中适合当前章节的技术素材，但不要提到“知识库”“历史文档”“参考资料”或素材来源。
 6. 不要提到“原方案”“历史文档”“用户原文”或“底稿”。
 7. 严禁输出 Mermaid、PlantUML、Graphviz、flowchart、graph、sequenceDiagram 等图表代码块、mermaid.ink 链接或图片 Markdown。
 8. restored-content.md 可能包含原方案 Markdown 标题行或编号标题，例如“# 第一章...”“## 第一节...”“### 二、...”“（一）...”，这些只作为章节定位线索，不属于最终正文。
@@ -1275,7 +1277,7 @@ workspace 文件：
 最终请把当前小节完整正文写入 optimized-section.md。该文件只能包含正文内容，不要包含标题或说明。`, globalFactsMode);
 }
 
-function buildAgentRestoredChapterContentFiles({ chapter, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent, wordControl, generationTarget = 0 }) {
+function buildAgentRestoredChapterContentFiles({ chapter, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent, wordControl, generationTarget = 0 }) {
   return [
     {
       path: 'chapter-context.md',
@@ -1291,6 +1293,9 @@ ${projectOverview || '未提供'}
 
 # 本章节需要使用的全局事实变量
 ${String(selectedFactsText || '').trim() || '未提供'}
+
+# 与当前章节最相关的招标文件原文片段
+${String(tenderContextText || '').trim() || '无'}
 
 # 用户对本次重新生成的额外要求
 ${String(regenerateRequirement || '').trim() || '无'}
@@ -4487,6 +4492,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
             chapter: item,
             projectOverview,
             selectedFactsText,
+            tenderContextText,
             regenerateRequirement,
             contentPlan,
             knowledgeContents,
