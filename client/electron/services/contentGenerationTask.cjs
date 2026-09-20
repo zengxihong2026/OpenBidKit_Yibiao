@@ -45,8 +45,16 @@ const TABLE_CLEANUP_CONTEXT_CHARS = 600;
 const TABLE_CLEANUP_BATCH_CHAR_LIMIT = 30000;
 const CONTENT_GENERATION_PAUSED = 'CONTENT_GENERATION_PAUSED';
 const CONTENT_PLAN_VERSION = 5;
-// Token 优化：单个正文小节默认最多注入 3 条知识库正文素材；如需更多内容应通过后续局部补充，而不是把整库上下文带入每次生成。\nconst CONTENT_KNOWLEDGE_TOP_K = 3;
+// Token 优化：单个正文小节默认最多注入 3 条知识库正文素材；如需更多内容应通过后续局部补充，而不是把整库上下文带入每次生成。
+const CONTENT_KNOWLEDGE_TOP_K = 3;
 const CONTENT_FACT_TITLE_MAX = 8;
+const CONTENT_PLAN_BATCH_SIZE = 10;
+const CONTENT_PROJECT_OVERVIEW_MAX_CHARS = 4000;
+const CONTENT_SELECTED_FACTS_MAX_CHARS = 8000;
+const CONTENT_KNOWLEDGE_ITEM_MAX_CHARS = 5000;
+const CONTENT_KNOWLEDGE_TOTAL_MAX_CHARS = 12000;
+const CONSISTENCY_RISK_AUDIT_RATIO = 0.35;
+const CONSISTENCY_RISK_AUDIT_MIN_COUNT = 8;
 const TABLE_REQUIREMENT_LABELS = {
   none: '不要',
   light: '少量',
@@ -178,6 +186,69 @@ function resolveGlobalFactsByTitles(titles, globalFacts) {
     .map((group) => ({ title: singleLine(group.title), content: String(group.content || '').trim() }));
 }
 
+function compactPromptText(value, maxChars, options = {}) {
+  const text = String(value || '').trim();
+  const limit = Math.max(0, Number(maxChars) || 0);
+  if (!text || !limit || text.length <= limit) return text;
+  const headChars = Math.max(1, Math.floor(limit * (options.headRatio ?? 0.72)));
+  const tailChars = Math.max(1, limit - headChars);
+  return `${text.slice(0, headChars)}\n…（上下文已压缩，省略中间 ${Math.max(0, text.length - headChars - tailChars)} 字）…\n${text.slice(-tailChars)}`;
+}
+
+function compactKnowledgeContents(contents) {
+  const totalLimit = CONTENT_KNOWLEDGE_TOTAL_MAX_CHARS;
+  let remaining = totalLimit;
+  const result = [];
+  for (const content of contents || []) {
+    if (remaining <= 0) break;
+    const compacted = compactPromptText(content, Math.min(CONTENT_KNOWLEDGE_ITEM_MAX_CHARS, remaining));
+    if (!compacted) continue;
+    result.push(compacted);
+    remaining -= compacted.length;
+  }
+  return result;
+}
+
+function scoreConsistencyAuditRisk(context) {
+  const item = context?.item || {};
+  const text = `${item.title || ''}\n${item.description || ''}\n${String(context?.content || '').slice(0, 5000)}`;
+  const rules = [
+    [5, /(废标|否决|拒绝|资格审查|强制性|必须满足|不得|禁止)/],
+    [4, /(评分|评分点|评审|得分|技术参数|关键指标)/],
+    [4, /(合同|付款|质保|运维|售后|服务期限)/],
+    [3, /(工期|周期|天内|小时内|日内|交付|验收)/],
+    [3, /(人数|项目经理|技术负责人|人员|团队|驻场)/],
+    [3, /(设备|型号|品牌|规格|参数|容量|数量|功率)/],
+    [2, /(安全|应急|风险|事故|保险|合规|标准|规范)/],
+  ];
+  return rules.reduce((score, [weight, pattern]) => score + (pattern.test(text) ? weight : 0), 0);
+}
+
+function selectConsistencyAuditTargets(targets, options = {}) {
+  const source = Array.isArray(targets) ? targets : [];
+  if (!source.length) return [];
+  const mode = String(options.mode || 'risk-based').trim() || 'risk-based';
+  if (mode !== 'risk-based' || source.length <= 20) return source;
+
+  const ranked = source
+    .map((context, index) => ({ context, index, risk: scoreConsistencyAuditRisk(context) }))
+    .sort((a, b) => b.risk - a.risk || a.index - b.index);
+  const targetCount = Math.min(
+    source.length,
+    Math.max(CONSISTENCY_RISK_AUDIT_MIN_COUNT, Math.ceil(source.length * CONSISTENCY_RISK_AUDIT_RATIO)),
+  );
+  const selected = ranked.slice(0, targetCount).map((entry) => entry.context);
+  const selectedIds = new Set(selected.map((context) => context.item.id));
+  const lowRiskStep = Math.max(1, Math.floor(ranked.length / 10));
+  for (let index = Math.floor(ranked.length / 2); index < ranked.length && selected.length < targetCount + 2; index += lowRiskStep) {
+    const context = ranked[index]?.context;
+    if (context && !selectedIds.has(context.item.id)) {
+      selected.push(context);
+      selectedIds.add(context.item.id);
+    }
+  }
+  return selected.slice(0, Math.min(source.length, targetCount + 2));
+}
 function formatSelectedGlobalFactsForPrompt(globalFacts) {
   return (Array.isArray(globalFacts) ? globalFacts : [])
     .map((group) => {
@@ -917,22 +988,25 @@ function buildChapterContentMessages({ chapter, projectOverview, selectedFactsTe
     },
   ];
 
-  if (String(projectOverview || '').trim()) {
-    messages.push({ role: 'user', content: `项目概述信息：\n${projectOverview}` });
+  const compactProjectOverview = compactPromptText(projectOverview, CONTENT_PROJECT_OVERVIEW_MAX_CHARS);
+  const compactSelectedFactsText = compactPromptText(selectedFactsText, CONTENT_SELECTED_FACTS_MAX_CHARS);
+  if (compactProjectOverview) {
+    messages.push({ role: 'user', content: `项目概述信息：\n${compactProjectOverview}` });
   }
   if (String(preSectionInstruction || '').trim()) {
     messages.push({ role: 'user', content: String(preSectionInstruction || '').trim() });
   }
-  appendSelectedFactsMessage(messages, selectedFactsText);
+  appendSelectedFactsMessage(messages, compactSelectedFactsText);
 
-  if (knowledgeContents?.length) {
+  const boundedKnowledgeContents = compactKnowledgeContents(knowledgeContents);
+  if (boundedKnowledgeContents.length) {
     messages.push({
       role: 'user',
       content: '参考正文素材使用规则：以下内容只作为可吸收的技术素材。请改写为当前项目语境下的投标技术方案正文，不要照抄，不要提到“知识库”“历史文档”“参考资料”或素材来源。',
     });
     messages.push({
       role: 'user',
-      content: `参考正文素材：\n${formatKnowledgeContentsForPrompt(knowledgeContents)}`,
+      content: `参考正文素材：\n${formatKnowledgeContentsForPrompt(boundedKnowledgeContents)}`,
     });
   }
 
