@@ -153,7 +153,7 @@ function buildMermaidGenerationMessages(execution) {
     },
     {
       role: 'user',
-      content: `最终图题：${title}\n\n参考正文：\n${execution.reference}\n\n请返回：\n{\n  "code": "flowchart TD..."\n}`,
+      content: `最终图题：${title}\n\n参考正文：\n${compactIllustrationReference(execution.reference, 10000)}\n\n请返回：\n{\n  "code": "flowchart TD..."\n}`,
     },
   ];
 }
@@ -208,7 +208,7 @@ function buildMermaidRepairMessages(execution, mermaidPlan, errorMessage, attemp
     },
     {
       role: 'user',
-      content: `参考正文：\n${execution.reference}\n\n最终图题：${title}\n修复轮次：${attempt}/${MERMAID_REPAIR_ATTEMPTS}\n渲染错误：${errorMessage}\n\n待修复代码：\n${mermaidPlan.code}\n\n请返回：\n{ "code": "修复后的 Mermaid 代码" }`,
+      content: `参考正文：\n${compactIllustrationReference(execution.reference, 10000)}\n\n最终图题：${title}\n修复轮次：${attempt}/${MERMAID_REPAIR_ATTEMPTS}\n渲染错误：${errorMessage}\n\n待修复代码：\n${mermaidPlan.code}\n\n请返回：\n{ "code": "修复后的 Mermaid 代码" }`,
     },
   ];
 }
