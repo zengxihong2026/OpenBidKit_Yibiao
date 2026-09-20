@@ -10,9 +10,22 @@ function normalize(value) {
 
 function extractKeywords(text) {
   const source = normalize(text).toLowerCase();
-  const cjk = source.match(CJK_TOKEN_RE) || [];
+  const cjkRuns = source.match(CJK_TOKEN_RE) || [];
+  const chineseNgrams = [];
+  const stopwords = new Set(['项目', '方案', '内容', '要求', '工作', '进行', '相关', '本章', '当前', '以及', '以及其']);
+  for (const run of cjkRuns) {
+    const length = run.length;
+    for (let size = 2; size <= Math.min(4, length); size += 1) {
+      for (let index = 0; index + size <= length; index += 1) {
+        const token = run.slice(index, index + size);
+        if (!stopwords.has(token)) chineseNgrams.push(token);
+      }
+    }
+  }
   const words = source.match(WORD_TOKEN_RE) || [];
-  const tokens = [...cjk, ...words].map((token) => token.trim()).filter((token) => token.length >= 2);
+  const tokens = [...chineseNgrams, ...words]
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2);
   return [...new Set(tokens)];
 }
 
