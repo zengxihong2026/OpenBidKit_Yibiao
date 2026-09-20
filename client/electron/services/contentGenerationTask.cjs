@@ -31,6 +31,7 @@ const {
 
 const DEFAULT_CONTEXT_LENGTH_LIMIT = 400000;
 const AGENT_CONTEXT_THRESHOLD_RATIO = 0.7;
+const ORIGINAL_RESTORE_AGENT_THRESHOLD_RATIO = 0.5;
 const DEFAULT_TEXT_CONCURRENCY_LIMIT = 10;
 const DEFAULT_IMAGE_CONCURRENCY_LIMIT = 2;
 const INTERRUPTED_SECTION_ERROR = '上次生成被中断，请继续生成。';
@@ -4415,10 +4416,10 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         globalFactTitlesText,
       });
       let result;
-      if (shouldUseAgentForMessages(aiService, restoreMessages)) {
+      if (getMessagesContentLength(restoreMessages) > getTextContextLengthLimit(aiService) * ORIGINAL_RESTORE_AGENT_THRESHOLD_RATIO) {
         const messagesLength = getMessagesContentLength(restoreMessages);
         const contextLengthLimit = getTextContextLengthLimit(aiService);
-        logs = [...logs, `原方案还原映射提示词 ${messagesLength} 字符，超过上下文阈值 ${Math.floor(contextLengthLimit * AGENT_CONTEXT_THRESHOLD_RATIO)}，切换 Agent 文件模式。`];
+        logs = [...logs, `原方案还原映射提示词 ${messagesLength} 字符，超过专用阈值 ${Math.floor(contextLengthLimit * ORIGINAL_RESTORE_AGENT_THRESHOLD_RATIO)}，切换 Agent 文件模式。`];
         writeDeveloperLog('original_restore.agent.start', {
           message_chars: messagesLength,
           context_length_limit: contextLengthLimit,
