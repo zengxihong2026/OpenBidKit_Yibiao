@@ -24,6 +24,10 @@ const {
   retrieveTenderContext,
   formatTenderContextForPrompt,
 } = require('./tenderContextRetriever.cjs');
+const {
+  buildTenderKnowledgeSnapshot,
+  formatTenderKnowledgeForPrompt,
+} = require('./tenderKnowledge.cjs');
 
 const DEFAULT_CONTEXT_LENGTH_LIMIT = 400000;
 const AGENT_CONTEXT_THRESHOLD_RATIO = 0.7;
@@ -959,7 +963,7 @@ ${renderKnowledgeItemsForPrompt(
     )}`,
   });
 
-  messages.push({ role: 'user', content: `招标文件关键信息（用于判断正文需要引用哪些事实）：\n${formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText)}` });
+  messages.push({ role: 'user', content: `结构化招标知识快照（用于判断正文需要响应哪些事实）：\n${tenderKnowledgeText || '未提供'}` });
   if (String(globalFactTitlesText || '').trim()) {
     messages.push({ role: 'user', content: `Step04 全局事实变量标题清单（编排时只能选择标题，不要输出具体变量内容）：\n${globalFactTitlesText}` });
   }
@@ -3093,10 +3097,6 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
   const globalFactTitlesText = formatGlobalFactTitlesForPrompt(globalFacts);
   const allowedFactTitles = new Set(globalFacts.map((group) => singleLine(group?.title)).filter(Boolean));
   const bidAnalysisFactsText = formatBidAnalysisFactsForPrompt(storedPlan);
-  const compactBidKeyInfoText = compactPromptText(
-    formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText),
-    4500,
-  );
   const isExpansionWorkflow = storedPlan.workflowKind === 'existing-plan-expansion';
   let originalPlanMarkdown = '';
   let originalPlanSegments = [];
@@ -3120,10 +3120,6 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
 
   const projectOverview = outlineData.project_overview || storedPlan.projectOverview || '';
   const techRequirements = storedPlan.techRequirements || '';
-  const compactBidKeyInfoText = compactPromptText(
-    formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText),
-    5000,
-  );
   let tenderMarkdown = '';
   let tenderContextIndex = null;
   const tenderContextCache = new Map();
@@ -3134,8 +3130,17 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     }
   } catch (error) {
     tenderMarkdown = '';
+    tenderContextIndex = null;
     writeDeveloperLog('tender_context.load.error', { error: error.message || String(error) });
   }
+
+  const tenderKnowledgeSnapshot = buildTenderKnowledgeSnapshot({
+    tenderContextIndex,
+    tenderMarkdown,
+    bidAnalysisTasks: storedPlan.bidAnalysisTasks,
+    projectOverview,
+  });
+  const tenderKnowledgeText = formatTenderKnowledgeForPrompt(tenderKnowledgeSnapshot, 6500);
 
   function getTenderContextForItem(item) {
     if (!tenderMarkdown) return '';
@@ -4141,7 +4146,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           { maxItems: 80, maxChars: 12000 },
         ),
       )}` },
-      { role: 'user', content: `招标文件关键信息：\n${compactBidKeyInfoText || '未提供'}` },
+      { role: 'user', content: `结构化招标知识快照：\n${tenderKnowledgeText || '未提供'}` },
       { role: 'user', content: `Step04 全局事实变量标题清单：\n${globalFactTitlesText || '未提供'}` },
       { role: 'user', content: `当前批次小节：\n${rows}` },
       { role: 'user', content: `请严格返回：
