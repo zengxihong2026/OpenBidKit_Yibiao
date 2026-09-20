@@ -1843,28 +1843,7 @@ function buildConsistencyAuditMessages({ group, globalFactsText, bidAnalysisFact
   return [
     {
       role: 'user',
-      content: `你是投标技术方案全文一致性审计助手。请审计本组正文是否与给定事实冲突。
-
-要求：
-1. 只返回 JSON，不要输出解释、总结或 Markdown。
-2. 只找正文中已经明确写出、且与事实相违背的内容。
-3. 正文没有涉及某条事实时，不要报告缺失，不要建议补充。
-4. 不报告文风、质量、重复、篇幅、表达优化等问题。
-5. section_id 必须来自允许的目录编号清单，禁止编造编号。
-6. 只筛选冲突目录编号和冲突证据，不要重写正文。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\n7. 全局事实中的【待填写】不是冲突，不要要求正文补成具体值，也不要把缺失项当成需要杜撰的内容。` : ''}
-
-返回格式：
-{
-  "conflicts": [
-    {
-      "section_id": "1.2.3",
-      "fact_title": "相关事实变量标题",
-      "evidence": "正文中的冲突原文摘录",
-      "reason": "为什么与事实冲突",
-      "severity": "high"
-    }
-  ]
-}`,
+      content: `你是标书一致性审计助手，只检查当前分组正文与事实的明确冲突。\n只返回 JSON conflicts；不报告缺失、文风、重复或质量问题；section_id 只能来自清单；只给冲突证据、事实标题、原因和严重度。\n${buildContentFactCompletenessInstruction(globalFactsMode) ? '【待填写】不是冲突，不得要求杜撰具体值。' : ''}\n格式：{"conflicts":[{"section_id":"1.2.3","fact_title":"","evidence":"","reason":"","severity":"high"}]}``,
     },
     { role: 'user', content: `Step04 全局事实变量（已按一致性审计上下文预算压缩）：\n${boundedGlobalFactsText || '未提供'}` },
     { role: 'user', content: `Step02 关键解析结果（已按一致性审计上下文预算压缩）：\n${boundedBidAnalysisFactsText || '未提供'}` },
