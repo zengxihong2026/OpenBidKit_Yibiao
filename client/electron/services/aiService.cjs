@@ -864,7 +864,7 @@ async function parseOrRepairJsonResponseWithConfig(app, config, request, content
 
 async function collectJsonResponseWithConfig(app, config, request) {
   const preparedMessages = await prepareMultimodalMessages(config, request.messages);
-  const maxRetries = request.max_retries ?? 2;
+  const maxRetries = request.max_retries ?? 1;
   const totalAttempts = maxRetries + 1;
   const responseFormat = request.response_format || { type: 'json_object' };
   const progressLabel = request.progressLabel || 'JSON结果';
