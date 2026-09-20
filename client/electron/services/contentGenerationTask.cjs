@@ -1506,7 +1506,7 @@ function buildOriginalRestoreRepairMessages({ invalidContent, issues }, targets,
     { role: 'user', content: `当前可还原叶子节点：\n${formatRestoreTargetsForPrompt(targets) || '无'}` },
     { role: 'user', content: `原方案段落（用于判断 source_ids 是否只有标题、编号或实质正文）：\n${formatOriginalSegmentsForPrompt(originalSegments) || '无'}` },
     { role: 'user', content: `错误列表：\n${issueLines}` },
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
@@ -1558,7 +1558,7 @@ function buildContentExpansionRepairMessages({ invalidContent, issues }, current
     },
     { role: 'user', content: `错误列表：\n${issueLines}` },
     ...currentContentBlock,
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
@@ -1959,7 +1959,7 @@ function buildConsistencyAuditRepairMessages({ invalidContent, issues }, allowed
 ${JSON.stringify(Array.from(allowedSectionIds || []), null, 2)}`,
     },
     { role: 'user', content: `错误列表：\n${issueLines}` },
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
@@ -2078,7 +2078,7 @@ function buildConsistencyRepairJsonRepairMessages({ invalidContent, issues }, ex
 6. 如果无法修复，返回 {"patches":[]}。`,
     },
     { role: 'user', content: `错误列表：\n${issueLines}` },
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
@@ -2246,7 +2246,7 @@ function buildOriginalCoverageAuditJsonRepairMessages({ invalidContent, issues }
 ${JSON.stringify(allowedSourceIds, null, 2)}`,
     },
     { role: 'user', content: `错误列表：\n${issueLines}` },
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
@@ -2614,7 +2614,7 @@ function buildWordAdjustmentRepairMessages({ invalidContent, issues }, expectedM
     { role: 'user', content: `请把待修复内容整理为正文局部字数调整 JSON。mode 必须是 ${expectedMode}，granularity 必须是 ${expectedGranularity}，operations 至少一项。${operationRule} content 不得包含标题、图片、Mermaid、代码块或表格，不得破坏列表层级、事实参数和服务承诺。返回格式：${responseFormat}。只返回 JSON。` },
     { role: 'user', content: `错误列表：\n${(issues || []).map((item, index) => `${index + 1}. ${item}`).join('\n')}` },
     { role: 'user', content: `当前正文：\n${String(currentContent || '').slice(0, 60000)}` },
-    { role: 'user', content: `待修复内容：\n${String(invalidContent || '').slice(0, 60000)}` },
+    { role: 'user', content: `待修复内容：\n${String(invalidContent || '').slice(0, 24000)}` },
   ];
 }
 
