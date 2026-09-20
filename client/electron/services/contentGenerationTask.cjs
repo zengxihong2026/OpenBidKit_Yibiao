@@ -1055,7 +1055,7 @@ function buildChapterContentMessages({ chapter, projectOverview, selectedFactsTe
   if (boundedKnowledgeContents.length) {
     messages.push({
       role: 'user',
-      content: '参考正文素材使用规则：以下内容只作为可吸收的技术素材。请改写为当前项目语境下的投标技术方案正文，不要照抄，不要提到“知识库”“历史文档”“参考资料”或素材来源。',
+      content: '参考素材仅供吸收改写；不要照抄，不要提及素材来源。',
     });
     messages.push({
       role: 'user',
@@ -1079,15 +1079,9 @@ function buildChapterContentMessages({ chapter, projectOverview, selectedFactsTe
 
   messages.push({
     role: 'user',
-    content: `请为以下标书章节生成具体内容：
-
-当前章节信息：
-章节ID: ${chapterId}
-章节标题: ${chapterTitle}
-章节描述: ${chapterDescription}
-
-请结合项目概述信息、本章节全局事实变量、参考正文素材和正文编排决策，围绕当前章节标题、描述和写作重点生成详细的专业内容。
-直接返回编写的正文内容，不要输出标题、Markdown 标题、带任何形式编号的加粗引导语、伪目录标题、解释、总结等任何其他内容`,
+    content: `当前章节：${chapterId} ${chapterTitle}
+章节描述：${chapterDescription}
+请结合已提供的项目、招标、事实、素材和编排信息，直接输出当前章节正文；不要输出标题、伪目录、解释或总结。`,
   });
   const sectionWordRequirement = buildSectionWordRequirement(wordControl, false, generationTarget);
   if (sectionWordRequirement) messages.push({ role: 'user', content: sectionWordRequirement });
