@@ -2102,30 +2102,7 @@ function buildOriginalCoverageAuditMessages({ target }) {
   return [
     {
       role: 'user',
-      content: `你是投标技术方案原方案覆盖审计助手。请检查当前小节正文是否保留了原方案来源段中的实质内容。
-
-要求：
-1. 只返回 JSON，不要输出解释、总结或 Markdown。
-2. 必须对每个 source_id 返回一条 items 记录，covered 也必须返回。
-3. 可接受改写、扩写、调序、合并和专业化表达；不要因为不是逐字一致就判为缺失。
-4. 重点检查原方案中的实质信息、技术路线、服务承诺、设备参数、人员安排、周期、验收、售后、实施方法是否仍然保留。
-5. status 只能是 covered、partial、missing、conflict。
-6. covered 表示核心内容已经保留；partial 表示部分核心信息缺失；missing 表示该来源段核心内容基本没有体现；conflict 表示正文与来源段核心事实明显相反或矛盾。
-7. conflict 只报告，不要求修复；partial/missing 请给出 missing_points 和 repair_suggestion。
-8. node_id 必须是当前小节编号，source_id 必须来自允许清单。
-
-返回格式：
-{
-  "items": [
-    {
-      "source_id": "P001",
-      "node_id": "当前小节编号",
-      "status": "covered",
-      "missing_points": [],
-      "repair_suggestion": ""
-    }
-  ]
-}`,
+      content: `你是原方案覆盖审计助手。只返回 JSON items。\n逐条判断每个 source_id 的核心内容在当前小节是否仍被保留：covered/partial/missing/conflict；允许改写、扩写、调序和合并，不要求逐字一致。\n只报告来源段核心事实、技术路线、参数、人员、周期、验收、售后、实施方法等实质信息；不要报告文风或质量问题。\n格式：{"items":[{"source_id":"P001","node_id":"当前小节编号","status":"covered","missing_points":[],"repair_suggestion":""}]}``,
     },
     { role: 'user', content: `当前小节：${target.item.id || 'unknown'} ${target.item.title || '未命名章节'}\n路径：${formatChapterPath(target)}\n描述：${target.item.description || ''}` },
     { role: 'user', content: `允许的 source_id：\n${JSON.stringify(allowedSourceIds, null, 2)}` },
@@ -2245,28 +2222,7 @@ function buildOriginalCoverageRepairMessages({ target, coverageItems, currentCon
   return [
     {
       role: 'user',
-      content: `你是投标技术方案正文原方案覆盖修复助手。请只针对当前小节返回一次局部补写 patch，用于补回原方案中缺失的实质内容。
-
-要求：
-1. 只返回 JSON，不要输出解释、总结或 Markdown 代码围栏。
-2. 不要返回完整正文，只返回一次 insert 或 replace 操作。
-3. operation 只能是 "insert" 或 "replace"。
-4. 优先使用 insert 在合适段落后补充缺失内容；如果正文已有同主题但内容不完整，可使用 replace 扩写该段。
-5. insert 时 anchor 填写建议插入在哪个当前正文段落之后；适合放末尾时写 "end"。
-6. replace 时 target_text 必须逐字复制当前小节正文中的完整待替换 Markdown 原文块，不得摘要、改写或只返回其中一句。
-7. replace 目标块如为 Markdown 列表、表格、引用、加粗引导块或连续多行结构，target_text 必须包含完整结构。
-8. content 只写新增或替换后的正文片段，不要包含章节标题。
-9. 必须补回审计指出的 partial/missing 核心信息，但不要提到“原方案”“来源段”“用户原文”。
-10. 不要新增图片 Markdown、Mermaid、代码块或伪目录标题，也不要选择图片 Markdown、Mermaid 或代码块作为 replace 的 target_text。
-11. 保持与当前小节职责一致，不要写其他章节内容。
-
-返回格式：
-{
-  "operation": "insert",
-  "anchor": "end",
-  "target_text": "replace 时填写逐字复制的完整待替换 Markdown 原文块，insert 时留空",
-  "content": "补写后的正文片段"
-}`,
+      content: `你是原方案覆盖修复助手。只返回一次 insert 或 replace JSON patch，不要完整重写正文。\n必须补回审计指出的 partial/missing 核心信息；不得编造事实，不得提到原方案/来源段。\nreplace 的 target_text 必须逐字且唯一命中当前正文；insert 的 anchor 也必须能唯一定位；不得修改图片、Mermaid、代码块、表格结构或章节标题。``,
     },
     { role: 'user', content: `当前小节：${target.item.id || 'unknown'} ${target.item.title || '未命名章节'}\n路径：${formatChapterPath(target)}\n描述：${target.item.description || ''}` },
     { role: 'user', content: `需要补回的原方案来源段：\n${formatOriginalCoverageSources(issueSources)}` },
