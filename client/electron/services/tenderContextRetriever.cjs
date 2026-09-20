@@ -119,10 +119,13 @@ function retrieveTenderContext(markdownOrIndex, query, options = {}) {
     if (selected.length >= maxSnippets || totalChars >= maxChars) break;
   }
   if (!selected.length) {
-    for (const unit of units.slice(0, Math.min(maxSnippets, units.length))) {
-      if (totalChars + unit.text.length > maxChars && selected.length) break;
-      selected.push({ score: 0, heading_path: unit.headingPath, text: unit.text });
-      totalChars += unit.text.length;
+    const fallback = units[0];
+    if (fallback) {
+      const fallbackText = fallback.text.length > Math.min(2000, maxChars)
+        ? fallback.text.slice(0, Math.min(2000, maxChars))
+        : fallback.text;
+      selected.push({ score: 0, heading_path: fallback.headingPath, text: fallbackText });
+      totalChars += fallbackText.length;
     }
   }
   return { query: normalize(query), keywords, snippets: selected, total_chars: totalChars };
