@@ -62,6 +62,20 @@ function splitTenderAgentSource(markdown, maxChars = 10000) {
   return parts;
 }
 
+function buildLargeMarkdownAgentFiles(label, markdown, maxChars = 10000) {
+  const parts = splitTenderAgentSource(markdown, maxChars);
+  if (parts.length <= 1) return [{ path: label, content: String(markdown || '').trim() || '未提供。' }];
+  const files = [];
+  const indexLines = [`# ${label.replace(/\.md$/i, '')}分片索引`, '', '先按标题定位相关分片，再按需读取；不要一次性读取全部原文。'];
+  parts.forEach((part, index) => {
+    const path = `${label.replace(/\.md$/i, '')}/part-${String(index + 1).padStart(3, '0')}.md`;
+    const heading = (part.match(/^\s*#{1,6}\s+.+$/m) || [])[0] || `第 ${index + 1} 片`;
+    indexLines.push(`- ${path}：${heading.trim()}，约 ${part.length} 字`);
+    files.push({ path, content: part });
+  });
+  return [{ path: label, content: indexLines.join('\n') }, ...files];
+}
+
 function buildTenderAgentFiles(tenderSources) {
   const files = [];
   for (const [index, source] of (tenderSources || []).entries()) {
@@ -220,7 +234,7 @@ function buildFileCatalog({ tenderPaths, isWorkingCopy, hasSectionHint, knowledg
     lines.push('- 参考知识库/条目-*.md：补充已有大项的具体内容。');
   }
   if (hasOriginalPlan) {
-    lines.push('- 原方案.md：已有方案扩写底稿，补充已有大项的具体内容。');
+    lines.push('- 原方案.md：已有方案扩写底稿索引；完整原方案按分片存放，先定位再按需读取。');
   }
   lines.push('- 材料说明.md：本次实际提供的文件清单，与上述用途一致。');
   return lines.join('\n');
@@ -428,7 +442,7 @@ async function runGlobalFactsTaskV2({
     knowledgeChars += bounded.length;
   });
   if (originalPlanMarkdown) {
-    files.push({ path: '原方案.md', content: originalPlanMarkdown });
+    files.push(...buildLargeMarkdownAgentFiles('原方案.md', originalPlanMarkdown, 10000));
   }
 
   const fileCatalog = buildFileCatalog({
