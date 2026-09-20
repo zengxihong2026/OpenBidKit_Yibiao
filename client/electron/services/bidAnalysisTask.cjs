@@ -1,8 +1,38 @@
 const { buildBidSectionContextHint } = require('../utils/bidSectionContext.cjs');
 const { mergeSegmentedAiResults } = require('../utils/segmentedAiResultMerger.cjs');
 const { splitUserTextByContextLimit } = require('../utils/userTextSplitter.cjs');
+const {
+  createTenderContextIndex,
+  retrieveTenderContext,
+  formatTenderContextForPrompt,
+} = require('./tenderContextRetriever.cjs');
 
 const PROMPT_CACHE_WARMUP_DELAY_MS = 5000;
+const TENDER_ANALYSIS_RETRIEVAL_THRESHOLD_CHARS = 24000;
+const TENDER_ANALYSIS_DEFAULT_RETRIEVAL_CHARS = 10000;
+const TENDER_ANALYSIS_BROAD_RETRIEVAL_CHARS = 18000;
+const TENDER_ANALYSIS_MAX_SNIPPETS = 10;
+
+const TASK_RETRIEVAL_HINTS = {
+  projectOverview: '项目名称 项目背景 项目概况 项目目标 项目规模 预算 实施内容 建设内容 技术特点 实施范围 时间安排',
+  techRequirements: '技术评分 评分标准 技术评分项 评分细则 技术要求 技术参数 技术方案 评审因素 评审标准',
+  projectInfo: '项目名称 项目编号 项目类型 预算 项目预算 项目地址 实施地点',
+  partAInfo: '招标人 采购人 甲方 招标单位 联系人 联系电话 地址',
+  deliveryAndServiceRequirements: '交付 实施周期 工期 交付期限 交付范围 实施地点 验收 质保 售后 响应 培训 文档',
+  procurementList: '采购清单 采购需求 货物需求 服务内容 数量 规格型号 技术参数 工程量清单 分项报价',
+  responseFileRequirements: '响应文件 投标文件 文件组成 格式 签字 盖章 装订 密封 上传 递交 偏离表 承诺函 附件',
+  qualificationReview: '资格条件 资格审查 投标人资格 资质 业绩 人员 法定代表人 授权',
+  complianceCheck: '符合性检查 实质性响应 偏离 重大偏差 文件完整性 无效响应',
+  openBid: '开标 开标时间 开标地点 开标要求 参与要求 无效标 异议 开标流程',
+  evaluationBid: '评标委员会 评标方法 评标原则 评分构成 评审办法 评标',
+  businessScoring: '商务评分 商务部分 企业业绩 资质 认证 荣誉 财务 人员',
+  discardedBids: '无效投标 废标 否决投标 不予受理 无效响应 重大偏差 实质性偏离 保证金 截止时间 资格',
+  signingProcess: '中标 中标通知书 合同授予 合同签订 履约保证金 合同文本',
+  terminationCondition: '合同解除 合同终止 违约 不可抗力 争议解决',
+  agentInfo: '代理机构 采购代理 联系人 电话 地址 邮箱 银行账户 开户行',
+  keyInfo: '招标公告 文件获取 获取时间 售价 投标截止 开标时间 开标地点 递交',
+  marginInfo: '投标保证金 保证金 缴纳方式 截止时间 退还 不予退还',
+};
 const MARKDOWN_MISSING_RESULT = '未提取到';
 
 function waitForPromptCacheWarmup() {
@@ -199,6 +229,32 @@ function isMissingMarkdownResult(task, content) {
   return task.output === 'markdown' && String(content || '').trim() === MARKDOWN_MISSING_RESULT;
 }
 
+function buildTaskRetrievalQuery(task, sectionHint) {
+  const id = String(task?.id || '').trim();
+  const hint = TASK_RETRIEVAL_HINTS[id] || [task?.label || '', task?.description || ''].join(' ');
+  return [hint, sectionHint || ''].filter(Boolean).join('\n');
+}
+
+function buildTenderAnalysisContext(fileContent, task, sectionHint, tenderContextIndex) {
+  const source = String(fileContent || '');
+  if (!source.trim()) return source;
+  if (source.length <= TENDER_ANALYSIS_RETRIEVAL_THRESHOLD_CHARS) return source;
+
+  const query = buildTaskRetrievalQuery(task, sectionHint);
+  const maxChars = ['projectOverview', 'techRequirements'].includes(task?.id)
+    ? TENDER_ANALYSIS_BROAD_RETRIEVAL_CHARS
+    : TENDER_ANALYSIS_DEFAULT_RETRIEVAL_CHARS;
+  const result = retrieveTenderContext(tenderContextIndex || source, query, {
+    maxSnippets: TENDER_ANALYSIS_MAX_SNIPPETS,
+    maxChars,
+  });
+  const retrieved = formatTenderContextForPrompt(result);
+  if (retrieved.length >= 1200) {
+    return '以下为与“' + (task?.label || '当前解析任务') + '”最相关的招标文件原文片段。请基于这些片段完成任务；如某个字段在片段中没有出现，请填写“没有提及”，不要猜测。\n\n' + retrieved;
+  }
+  return source;
+}
+
 function buildTenderContextMessages(fileContent, sectionHint) {
   const messages = [
     { role: 'system', content: stableSystemPrompt },
@@ -218,20 +274,38 @@ function buildMessages(fileContent, task, sectionHint) {
   return messages;
 }
 
-async function runSingleBidAnalysisPromptTask({ aiService, fileContent, task, sectionHint, logTitle }) {
+async function runSingleBidAnalysisPromptTask({ aiService, fileContent, task, sectionHint, logTitle, tenderContextIndex }) {
+  const analysisContext = buildTenderAnalysisContext(fileContent, task, sectionHint, tenderContextIndex);
   return aiService.chat({
-    messages: buildMessages(fileContent, task, sectionHint),
+    messages: buildMessages(analysisContext, task, sectionHint),
     response_format: task.output === 'json' ? { type: 'json_object' } : undefined,
     logTitle: logTitle || `招标解析-${task.label}`,
   });
 }
 
-async function runBidAnalysisPromptTaskOnce({ aiService, fileContent, fileSegments, task, sectionHint }) {
+async function runBidAnalysisPromptTaskOnce({ aiService, fileContent, fileSegments, task, sectionHint, tenderContextIndex }) {
+  const source = String(fileContent || '');
+  if (source.length > TENDER_ANALYSIS_RETRIEVAL_THRESHOLD_CHARS && tenderContextIndex) {
+    return runSingleBidAnalysisPromptTask({
+      aiService,
+      fileContent: source,
+      task,
+      sectionHint,
+      tenderContextIndex,
+    });
+  }
+
   const segments = Array.isArray(fileSegments) && fileSegments.length
     ? fileSegments
-    : splitUserTextByContextLimit(fileContent, typeof aiService.getConfig === 'function' ? aiService.getConfig() : {});
+    : splitUserTextByContextLimit(source, typeof aiService.getConfig === 'function' ? aiService.getConfig() : {});
   if (segments.length <= 1) {
-    return runSingleBidAnalysisPromptTask({ aiService, fileContent: segments[0] || fileContent, task, sectionHint });
+    return runSingleBidAnalysisPromptTask({
+      aiService,
+      fileContent: segments[0] || source,
+      task,
+      sectionHint,
+      tenderContextIndex,
+    });
   }
 
   const segmentResults = await Promise.all(segments.map(async (segmentContent, index) => ({
@@ -242,6 +316,7 @@ async function runBidAnalysisPromptTaskOnce({ aiService, fileContent, fileSegmen
       fileContent: segmentContent,
       task,
       sectionHint,
+      tenderContextIndex,
       logTitle: `招标解析-${task.label}-第${index + 1}段`,
     }),
   })));
@@ -305,6 +380,7 @@ async function runBidAnalysisTask({ aiService, workspaceStore, updateTask, check
   });
   const currentConfig = typeof aiService.getConfig === 'function' ? aiService.getConfig() : {};
   const fileSegments = splitUserTextByContextLimit(fileContent, currentConfig);
+  const tenderContextIndex = createTenderContextIndex(fileContent);
   const forceRerun = payload.force_rerun === true || payload.forceRerun === true;
   const requestedTaskIds = Array.isArray(payload.task_ids)
     ? new Set(payload.task_ids.filter((taskId) => typeof taskId === 'string'))
@@ -393,6 +469,7 @@ async function runBidAnalysisTask({ aiService, workspaceStore, updateTask, check
       fileSegments,
       task,
       sectionHint,
+      tenderContextIndex,
     });
     const trimmedContent = String(content || '').trim();
     if (!trimmedContent) {
