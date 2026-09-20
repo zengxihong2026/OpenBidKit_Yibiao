@@ -1836,8 +1836,36 @@ ${entry.content || ''}
 </section>`).join('\n\n');
 }
 
+function selectRelevantConsistencyFacts(globalFactsText, query, maxChars = 3500) {
+  const source = String(globalFactsText || '').trim();
+  if (!source) return '';
+  const blocks = source.split(/(?=^##\s+)/m).map((block) => block.trim()).filter(Boolean);
+  if (blocks.length <= 1) return compactPromptText(source, maxChars);
+  const keywords = extractLocalPromptKeywords(query);
+  const ranked = blocks.map((block, index) => {
+    const lower = block.toLowerCase();
+    const score = keywords.reduce((sum, keyword) => {
+      if (!keyword) return sum;
+      const hits = lower.split(keyword).length - 1;
+      return sum + Math.min(6, hits * 2);
+    }, 0);
+    return { block, index, score };
+  }).sort((a, b) => b.score - a.score || a.index - b.index);
+  const selected = [];
+  let chars = 0;
+  for (const entry of ranked) {
+    if (chars >= maxChars) break;
+    const bounded = compactPromptText(entry.block, Math.min(1800, maxChars - chars));
+    if (!bounded) continue;
+    selected.push(bounded);
+    chars += bounded.length;
+  }
+  return selected.join('\n\n');
+}
+
 function buildConsistencyAuditMessages({ group, globalFactsText, bidAnalysisFactsText, globalFactsMode }) {
-  const boundedGlobalFactsText = compactPromptText(globalFactsText, CONSISTENCY_FACT_CONTEXT_MAX_CHARS);
+  const groupQuery = (group.items || []).map(({ item, content }) => `${item?.title || ''} ${item?.description || ''} ${String(content || '').slice(0, 1500)}`).join('\n');
+  const boundedGlobalFactsText = selectRelevantConsistencyFacts(globalFactsText, groupQuery, Math.min(CONSISTENCY_FACT_CONTEXT_MAX_CHARS, 3500));
   const boundedBidAnalysisFactsText = compactPromptText(bidAnalysisFactsText, Math.floor(CONSISTENCY_FACT_CONTEXT_MAX_CHARS / 2));
   const allowedIds = (group.items || []).map(({ item }) => item.id).filter(Boolean);
   return [
@@ -1919,7 +1947,8 @@ ${JSON.stringify(Array.from(allowedSectionIds || []), null, 2)}`,
 }
 
 function buildConsistencyRepairMessages({ context, conflicts, globalFactsText, bidAnalysisFactsText, currentContent, attempt, failures, tableRequirement, globalFactsMode }) {
-  const boundedGlobalFactsText = compactPromptText(globalFactsText, CONSISTENCY_FACT_CONTEXT_MAX_CHARS);
+  const repairQuery = `${context?.item?.title || ''} ${context?.item?.description || ''} ${String(currentContent || '').slice(0, 1500)}`;
+  const boundedGlobalFactsText = selectRelevantConsistencyFacts(globalFactsText, repairQuery, Math.min(CONSISTENCY_FACT_CONTEXT_MAX_CHARS, 3500));
   const boundedBidAnalysisFactsText = compactPromptText(bidAnalysisFactsText, Math.floor(CONSISTENCY_FACT_CONTEXT_MAX_CHARS / 2));
   const { item } = context;
   const tableAllowed = normalizeTableRequirement(tableRequirement) !== 'none';
