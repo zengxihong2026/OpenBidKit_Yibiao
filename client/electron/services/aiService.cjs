@@ -939,13 +939,32 @@ function dedupeAdjacentTextMessages(messages) {
   return result;
 }
 
-function applyOutputTokenLimit(body, config) {
+const DEFAULT_STAGE_OUTPUT_TOKEN_LIMITS = Object.freeze({
+  'tender-analysis': 12000,
+  'outline-generation': 9000,
+  'global-facts': 9000,
+  'content-planning': 7000,
+  consistency: 6000,
+  'original-restore': 6000,
+  'json-repair': 6000,
+  'word-adjustment': 8000,
+  'table-cleanup': 8000,
+});
+
+function resolveStageOutputTokenLimit(config, stage) {
+  if (Number(config?.output_token_limit) > 0) return Number(config.output_token_limit);
+  const limit = DEFAULT_STAGE_OUTPUT_TOKEN_LIMITS[String(stage || '').trim()];
+  return Number.isFinite(limit) && limit > 0 ? limit : 0;
+}
+
+function applyOutputTokenLimit(body, config, stage = '') {
   delete body.max_output_tokens;
   delete body.max_tokens;
-  if (config.output_token_limit > 0) {
-    body.max_completion_tokens = config.output_token_limit;
+  const limit = resolveStageOutputTokenLimit(config, stage);
+  if (limit > 0) {
+    body.max_completion_tokens = limit;
     // 官方只接受新字段；其他服务商保留原有的双字段请求方式。
-    if (config.text_model_provider !== 'official') body.max_tokens = config.output_token_limit;
+    if (config.text_model_provider !== 'official') body.max_tokens = limit;
   } else {
     delete body.max_completion_tokens;
   }
@@ -976,7 +995,7 @@ function createChatRequestBody(config, request, options = {}) {
     body.response_format = request.response_format;
   }
 
-  return applyOutputTokenLimit(body, config);
+  return applyOutputTokenLimit(body, config, request.stage);
 }
 
 // 保留 Pi 工具调用协议字段，并统一应用当前文本模型配置。
