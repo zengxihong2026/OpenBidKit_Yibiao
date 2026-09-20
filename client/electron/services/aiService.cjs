@@ -879,6 +879,9 @@ async function collectJsonResponseWithConfig(app, config, request) {
       timeout_ms: request.timeout_ms,
       timeout_message: request.timeout_message,
       logTitle,
+      stage: request.stage,
+      sectionId: request.sectionId,
+      batchId: request.batchId,
       signal: request.signal,
     });
 
