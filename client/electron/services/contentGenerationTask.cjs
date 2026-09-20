@@ -19,7 +19,11 @@ const {
 const { applyRangeEdits, findTextMatches } = require('../utils/textEdit.cjs');
 const { splitUserTextByContextLimit } = require('../utils/userTextSplitter.cjs');
 const { countReadableWords } = require('../utils/wordCount.cjs');
-const { retrieveTenderContext, formatTenderContextForPrompt } = require('./tenderContextRetriever.cjs');
+const {
+  createTenderContextIndex,
+  retrieveTenderContext,
+  formatTenderContextForPrompt,
+} = require('./tenderContextRetriever.cjs');
 
 const DEFAULT_CONTEXT_LENGTH_LIMIT = 400000;
 const AGENT_CONTEXT_THRESHOLD_RATIO = 0.7;
@@ -56,6 +60,9 @@ const CONTENT_TENDER_CONTEXT_MAX_CHARS = 7000;
 const CONTENT_TENDER_CONTEXT_SNIPPETS = 4;
 const CONTENT_KNOWLEDGE_ITEM_MAX_CHARS = 5000;
 const CONTENT_KNOWLEDGE_TOTAL_MAX_CHARS = 12000;
+const CONSISTENCY_FACT_CONTEXT_MAX_CHARS = 6000;
+const ORIGINAL_COVERAGE_SOURCE_MAX_CHARS = 3000;
+const ORIGINAL_COVERAGE_TOTAL_SOURCE_CHARS = 10000;
 const CONSISTENCY_RISK_AUDIT_RATIO = 0.35;
 const CONSISTENCY_RISK_AUDIT_MIN_COUNT = 8;
 const TABLE_REQUIREMENT_LABELS = {
@@ -1745,6 +1752,8 @@ ${entry.content || ''}
 }
 
 function buildConsistencyAuditMessages({ group, globalFactsText, bidAnalysisFactsText, globalFactsMode }) {
+  const boundedGlobalFactsText = compactPromptText(globalFactsText, CONSISTENCY_FACT_CONTEXT_MAX_CHARS);
+  const boundedBidAnalysisFactsText = compactPromptText(bidAnalysisFactsText, Math.floor(CONSISTENCY_FACT_CONTEXT_MAX_CHARS / 2));
   const allowedIds = (group.items || []).map(({ item }) => item.id).filter(Boolean);
   return [
     {
@@ -1772,8 +1781,8 @@ function buildConsistencyAuditMessages({ group, globalFactsText, bidAnalysisFact
   ]
 }`,
     },
-    { role: 'user', content: `Step04 全局事实变量：\n${globalFactsText || '未提供'}` },
-    { role: 'user', content: `Step02 关键解析结果（项目信息、甲方信息、交货和服务要求）：\n${bidAnalysisFactsText || '未提供'}` },
+    { role: 'user', content: `Step04 全局事实变量（已按一致性审计上下文预算压缩）：\n${boundedGlobalFactsText || '未提供'}` },
+    { role: 'user', content: `Step02 关键解析结果（已按一致性审计上下文预算压缩）：\n${boundedBidAnalysisFactsText || '未提供'}` },
     { role: 'user', content: `允许返回的目录编号清单：\n${JSON.stringify(allowedIds, null, 2)}` },
     { role: 'user', content: `待审计正文分组：\n${formatConsistencyAuditGroupContent(group)}` },
   ];
@@ -1846,6 +1855,8 @@ ${JSON.stringify(Array.from(allowedSectionIds || []), null, 2)}`,
 }
 
 function buildConsistencyRepairMessages({ context, conflicts, globalFactsText, bidAnalysisFactsText, currentContent, attempt, failures, tableRequirement, globalFactsMode }) {
+  const boundedGlobalFactsText = compactPromptText(globalFactsText, CONSISTENCY_FACT_CONTEXT_MAX_CHARS);
+  const boundedBidAnalysisFactsText = compactPromptText(bidAnalysisFactsText, Math.floor(CONSISTENCY_FACT_CONTEXT_MAX_CHARS / 2));
   const { item } = context;
   const tableAllowed = normalizeTableRequirement(tableRequirement) !== 'none';
   const failureBlock = (failures || []).length
@@ -1883,8 +1894,8 @@ function buildConsistencyRepairMessages({ context, conflicts, globalFactsText, b
   ]
 }`,
     },
-    { role: 'user', content: `Step04 全局事实变量：\n${globalFactsText || '未提供'}` },
-    { role: 'user', content: `Step02 关键解析结果（项目信息、甲方信息、交货和服务要求）：\n${bidAnalysisFactsText || '未提供'}` },
+    { role: 'user', content: `Step04 全局事实变量（已按一致性修复上下文预算压缩）：\n${boundedGlobalFactsText || '未提供'}` },
+    { role: 'user', content: `Step02 关键解析结果（已按一致性修复上下文预算压缩）：\n${boundedBidAnalysisFactsText || '未提供'}` },
     { role: 'user', content: `当前小节：${item.id || 'unknown'} ${item.title || '未命名章节'}\n路径：${formatChapterPath(context)}\n描述：${item.description || ''}` },
     { role: 'user', content: `审计发现的冲突：\n${JSON.stringify(conflicts || [], null, 2)}` },
     { role: 'user', content: `当前小节正文（带行号；patch 的 old_text/new_text 不要包含这些行号）：\n${formatContentWithLineNumbers(currentContent)}` },
@@ -1975,12 +1986,22 @@ function normalizeOriginalCoverageStatus(value) {
 }
 
 function formatOriginalCoverageSources(sources) {
-  return (sources || []).map((segment) => `<source id="${segment.id}">
+  const selected = [];
+  let totalChars = 0;
+  for (const segment of sources || []) {
+    if (totalChars >= ORIGINAL_COVERAGE_TOTAL_SOURCE_CHARS) break;
+    const remaining = ORIGINAL_COVERAGE_TOTAL_SOURCE_CHARS - totalChars;
+    const content = compactPromptText(segment.content, Math.min(ORIGINAL_COVERAGE_SOURCE_MAX_CHARS, remaining));
+    if (!content) continue;
+    selected.push(`<source id="${segment.id}">
 标题路径：${segment.title_path?.length ? segment.title_path.join(' > ') : '未识别标题'}
 字符数：${segment.chars || String(segment.content || '').length}
 原文：
-${segment.content || ''}
-</source>`).join('\n\n');
+${content}
+</source>`);
+    totalChars += content.length;
+  }
+  return selected.join('\n\n');
 }
 
 function buildOriginalCoverageAuditMessages({ target }) {
@@ -3020,6 +3041,10 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
   const globalFactTitlesText = formatGlobalFactTitlesForPrompt(globalFacts);
   const allowedFactTitles = new Set(globalFacts.map((group) => singleLine(group?.title)).filter(Boolean));
   const bidAnalysisFactsText = formatBidAnalysisFactsForPrompt(storedPlan);
+  const compactBidKeyInfoText = compactPromptText(
+    formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText),
+    5000,
+  );
   const isExpansionWorkflow = storedPlan.workflowKind === 'existing-plan-expansion';
   let originalPlanMarkdown = '';
   let originalPlanSegments = [];
@@ -3043,11 +3068,17 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
 
   const projectOverview = outlineData.project_overview || storedPlan.projectOverview || '';
   const techRequirements = storedPlan.techRequirements || '';
+  const compactBidKeyInfoText = compactPromptText(
+    formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText),
+    5000,
+  );
   let tenderMarkdown = '';
+  let tenderContextIndex = null;
   const tenderContextCache = new Map();
   try {
     if (typeof workspaceStore.readTenderMarkdown === 'function') {
       tenderMarkdown = String(workspaceStore.readTenderMarkdown() || '').trim();
+      tenderContextIndex = tenderMarkdown ? createTenderContextIndex(tenderMarkdown) : null;
     }
   } catch (error) {
     tenderMarkdown = '';
@@ -3059,7 +3090,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     const id = String(item?.id || '').trim();
     if (id && tenderContextCache.has(id)) return tenderContextCache.get(id);
     const query = [item?.title, item?.description].filter(Boolean).join('\n');
-    const result = retrieveTenderContext(tenderMarkdown, query, {
+    const result = retrieveTenderContext(tenderContextIndex || tenderMarkdown, query, {
       maxSnippets: CONTENT_TENDER_CONTEXT_SNIPPETS,
       maxChars: CONTENT_TENDER_CONTEXT_MAX_CHARS,
     });
@@ -4052,7 +4083,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
 7. table.needed 依据表格需求“${tableRequirementLabel}”判断，禁止为了形式硬插。`,
       },
       { role: 'user', content: `参考知识库轻量条目：\n${renderKnowledgeItemsForPrompt(knowledgeItems)}` },
-      { role: 'user', content: `招标文件关键信息：\n${compactPromptText(formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText), 7000)}` },
+      { role: 'user', content: `招标文件关键信息：\n${compactBidKeyInfoText || '未提供'}` },
       { role: 'user', content: `Step04 全局事实变量标题清单：\n${globalFactTitlesText || '未提供'}` },
       { role: 'user', content: `当前批次小节：\n${rows}` },
       { role: 'user', content: `请严格返回：
