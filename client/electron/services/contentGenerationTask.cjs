@@ -19,6 +19,7 @@ const {
 const { applyRangeEdits, findTextMatches } = require('../utils/textEdit.cjs');
 const { splitUserTextByContextLimit } = require('../utils/userTextSplitter.cjs');
 const { countReadableWords } = require('../utils/wordCount.cjs');
+const { retrieveTenderContext, formatTenderContextForPrompt } = require('./tenderContextRetriever.cjs');
 
 const DEFAULT_CONTEXT_LENGTH_LIMIT = 400000;
 const AGENT_CONTEXT_THRESHOLD_RATIO = 0.7;
@@ -51,6 +52,8 @@ const CONTENT_FACT_TITLE_MAX = 8;
 const CONTENT_PLAN_BATCH_SIZE = 10;
 const CONTENT_PROJECT_OVERVIEW_MAX_CHARS = 4000;
 const CONTENT_SELECTED_FACTS_MAX_CHARS = 8000;
+const CONTENT_TENDER_CONTEXT_MAX_CHARS = 7000;
+const CONTENT_TENDER_CONTEXT_SNIPPETS = 4;
 const CONTENT_KNOWLEDGE_ITEM_MAX_CHARS = 5000;
 const CONTENT_KNOWLEDGE_TOTAL_MAX_CHARS = 12000;
 const CONSISTENCY_RISK_AUDIT_RATIO = 0.35;
@@ -958,7 +961,7 @@ function formatKnowledgeContentsForPrompt(contents) {
     .join('\n\n');
 }
 
-function buildChapterContentMessages({ chapter, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, preSectionInstruction, wordControl, generationTarget = 0, globalFactsMode }) {
+function buildChapterContentMessages({ chapter, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, preSectionInstruction, wordControl, generationTarget = 0, globalFactsMode }) {
   const chapterId = chapter.id || 'unknown';
   const chapterTitle = chapter.title || '未命名章节';
   const chapterDescription = chapter.description || '';
@@ -992,6 +995,10 @@ function buildChapterContentMessages({ chapter, projectOverview, selectedFactsTe
   const compactSelectedFactsText = compactPromptText(selectedFactsText, CONTENT_SELECTED_FACTS_MAX_CHARS);
   if (compactProjectOverview) {
     messages.push({ role: 'user', content: `项目概述信息：\n${compactProjectOverview}` });
+  }
+  const boundedTenderContext = compactPromptText(tenderContextText, CONTENT_TENDER_CONTEXT_MAX_CHARS);
+  if (boundedTenderContext) {
+    messages.push({ role: 'user', content: `与当前章节最相关的招标文件原文片段（仅用于响应本章节要求，不要整篇复述）：\n${boundedTenderContext}` });
   }
   if (String(preSectionInstruction || '').trim()) {
     messages.push({ role: 'user', content: String(preSectionInstruction || '').trim() });
@@ -1047,6 +1054,7 @@ function buildRestoredChapterContentMessages({ chapter, projectOverview, selecte
     chapter,
     projectOverview,
     selectedFactsText,
+    tenderContextText,
     regenerateRequirement,
     contentPlan,
     knowledgeContents,
@@ -3030,6 +3038,30 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
 
   const projectOverview = outlineData.project_overview || storedPlan.projectOverview || '';
   const techRequirements = storedPlan.techRequirements || '';
+  let tenderMarkdown = '';
+  const tenderContextCache = new Map();
+  try {
+    if (typeof workspaceStore.readTenderMarkdown === 'function') {
+      tenderMarkdown = String(workspaceStore.readTenderMarkdown() || '').trim();
+    }
+  } catch (error) {
+    tenderMarkdown = '';
+    writeDeveloperLog('tender_context.load.error', { error: error.message || String(error) });
+  }
+
+  function getTenderContextForItem(item) {
+    if (!tenderMarkdown) return '';
+    const id = String(item?.id || '').trim();
+    if (id && tenderContextCache.has(id)) return tenderContextCache.get(id);
+    const query = [item?.title, item?.description].filter(Boolean).join('\n');
+    const result = retrieveTenderContext(tenderMarkdown, query, {
+      maxSnippets: CONTENT_TENDER_CONTEXT_SNIPPETS,
+      maxChars: CONTENT_TENDER_CONTEXT_MAX_CHARS,
+    });
+    const text = formatTenderContextForPrompt(result);
+    if (id) tenderContextCache.set(id, text);
+    return text;
+  }
   if (resume && storedPlan.contentGenerationTask?.status !== 'paused') {
     throw new Error('没有可继续的已暂停正文生成任务');
   }
@@ -3158,6 +3190,11 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
   let storedContentPlans = pruneContentGenerationPlans(fullRegenerate ? {} : storedPlan.contentGenerationPlans, leaves);
   let knowledgeItems = [];
   let allowedKnowledgeItemIds = new Set();
+  if (tenderMarkdown) {
+    log('已启用招标原文局部检索：正文生成仅注入与当前章节相关的片段。');
+  } else {
+    log('未读取到可用招标原文，正文生成继续使用项目概述和 Step02 关键解析结果。');
+  }
   let knowledgeContentMap = new Map();
   let sections = createInitialSections(leaves, fullRegenerate ? {} : storedPlan.contentGenerationSections);
   const touchedItemIds = new Set(contentRuntime.touched_item_ids);
@@ -4424,9 +4461,10 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
       const knowledgeContents = resolveKnowledgeContents(contentPlan.knowledge?.item_ids, knowledgeContentMap);
       const selectedFactsText = resolveSelectedFactsText(contentPlan, globalFacts);
       const generationTarget = computeGenerationWordTarget(wordControl, leaves.length);
+      const tenderContextText = getTenderContextForItem(item);
       const contentMessages = needsRestoredOptimization
-        ? buildRestoredChapterContentMessages({ chapter: item, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent: previousContent, wordControl, generationTarget, globalFactsMode })
-        : buildChapterContentMessages({ chapter: item, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, wordControl, generationTarget, globalFactsMode });
+        ? buildRestoredChapterContentMessages({ chapter: item, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent: previousContent, wordControl, generationTarget, globalFactsMode })
+        : buildChapterContentMessages({ chapter: item, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, wordControl, generationTarget, globalFactsMode });
 
       let generatedContent;
       if (needsRestoredOptimization && shouldUseAgentForMessages(aiService, contentMessages)) {
