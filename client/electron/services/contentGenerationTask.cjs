@@ -5245,6 +5245,44 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
       .filter(({ item, originalState, sources }) => sections[item.id]?.status === 'success' && originalState.validRestored && !originalState.needsOptimization && sources.length);
   }
 
+  function selectOriginalCoverageAuditTargets(targets, options = {}) {
+    const source = Array.isArray(targets) ? targets : [];
+    if (!source.length) return [];
+    const normalizedTargetId = String(options.targetItemId || '').trim();
+    if (normalizedTargetId) return source.filter((target) => target.item.id === normalizedTargetId);
+
+    const mode = String(options.mode || 'risk-based').trim() || 'risk-based';
+    if (mode !== 'risk-based' || source.length <= 24) return source;
+
+    const ranked = source
+      .map((target, index) => {
+        const sourceText = (target.sources || []).map((segment) => segment.content || '').join('\n').slice(0, 7000);
+        const itemText = `${target.item?.title || ''}\n${target.item?.description || ''}\n${target.content || ''}`;
+        const score = (target.sources?.length || 0) * 4
+          + Math.min(12, Math.floor((target.content || '').length / 2500))
+          + (/(参数|型号|设备|人员|项目经理|工期|周期|验收|质保|售后|安全|应急|承诺)/.test(sourceText) ? 8 : 0)
+          + (/(参数|型号|设备|人员|项目经理|工期|周期|验收|质保|售后|安全|应急|承诺)/.test(itemText) ? 5 : 0);
+        return { target, index, score };
+      })
+      .sort((a, b) => b.score - a.score || a.index - b.index);
+
+    const targetCount = Math.min(
+      source.length,
+      Math.max(8, Math.ceil(source.length * 0.4)),
+    );
+    const selected = ranked.slice(0, targetCount).map((entry) => entry.target);
+    const selectedIds = new Set(selected.map((target) => target.item.id));
+    const sampleStep = Math.max(1, Math.floor(ranked.length / 10));
+    for (let index = Math.floor(ranked.length / 2); index < ranked.length && selected.length < targetCount + 2; index += sampleStep) {
+      const target = ranked[index]?.target;
+      if (target && !selectedIds.has(target.item.id)) {
+        selected.push(target);
+        selectedIds.add(target.item.id);
+      }
+    }
+    return selected.slice(0, Math.min(source.length, targetCount + 2));
+  }
+
   function buildAgentOriginalCoverageSourcesMarkdown(targets) {
     const lines = ['# 原方案覆盖来源段', ''];
     for (const target of targets || []) {
@@ -5413,7 +5451,12 @@ workspace 文件说明：
       return { ran: false, fixedCount: 0, failedCount: 0 };
     }
 
-    const coverageTargets = buildOriginalCoverageAuditTargets('');
+    const rawCoverageTargets = buildOriginalCoverageAuditTargets('');
+    const coverageTargets = selectOriginalCoverageAuditTargets(rawCoverageTargets, {
+      mode: generationOptions.originalPlanCoverageMode
+        || generationOptions.original_plan_coverage_mode
+        || 'risk-based',
+    });
     const sectionIndex = buildAgentConsistencySectionIndex(coverageTargets);
     if (!sectionIndex.size) {
       writeDeveloperLog('original_coverage.agent.skipped', { reason: 'no_targets' });
@@ -5579,7 +5622,15 @@ workspace 文件说明：
       return { ran: false, fixedCount: 0, failedCount: 0 };
     }
 
-    const auditTargets = buildOriginalCoverageAuditTargets(options.targetItemId || targetItemId);
+    const rawAuditTargets = buildOriginalCoverageAuditTargets(options.targetItemId || targetItemId);
+    const auditTargets = selectOriginalCoverageAuditTargets(rawAuditTargets, {
+      targetItemId: options.targetItemId || targetItemId,
+      mode: options.originalPlanCoverageMode
+        || options.original_plan_coverage_mode
+        || generationOptions.originalPlanCoverageMode
+        || generationOptions.original_plan_coverage_mode
+        || 'risk-based',
+    });
     if (!auditTargets.length) {
       writeDeveloperLog('original_coverage.audit.skipped', { reason: 'no_targets', target_item_id: options.targetItemId || targetItemId || '' });
       logs = [...logs, '原方案覆盖审计跳过：没有可审计的已还原成功正文小节。'];
