@@ -1174,7 +1174,7 @@ async function runOutlineGenerationTaskV2({ aiService, agentService, ordinaryAge
         ]
       : [
           { path: OUTLINE_OUTPUT_FILE, content: JSON.stringify({ outline: lockedRoots }, null, 2) },
-          { path: '技术评分信息.md', content: storedPlan.techRequirements || '' },
+          { path: '技术评分信息.md', content: compactPromptText(storedPlan.techRequirements || '', 8000) },
           ...knowledgeFiles,
         ],
     signal: parallelSignal,
