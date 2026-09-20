@@ -35,6 +35,62 @@ const TASK_RETRIEVAL_HINTS = {
 };
 const MARKDOWN_MISSING_RESULT = '未提取到';
 
+const OPTIONAL_BID_ANALYSIS_BUNDLES = [
+  ['response-compliance', [
+    'responseFileRequirements',
+    'qualificationReview',
+    'complianceCheck',
+    'discardedBids',
+  ]],
+  ['timeline-admin', [
+    'agentInfo',
+    'keyInfo',
+    'marginInfo',
+    'openBid',
+    'signingProcess',
+    'terminationCondition',
+  ]],
+  ['evaluation-procurement', [
+    'procurementList',
+    'evaluationBid',
+    'businessScoring',
+  ]],
+];
+
+const OPTIONAL_BUNDLE_SCHEMAS = {
+  agentInfo: { output: 'json', fields: ['company_name','address','contact_person','contact_phone','email','bank_account_name','bank_account_number','bank_account_address','bank_account_address_detail'] },
+  keyInfo: { output: 'json', fields: ['bid_announcement_time','bid_file_get_way','bid_file_price','get_bid_file_time','bid_document_submission_location','bid_submission_deadline','bid_opening_time','bid_opening_address','other_notes'] },
+  marginInfo: { output: 'json', fields: ['bidding_deposit','payment_method','due_date','refund_conditions','non_refundable_conditions','other_notes'] },
+  openBid: { output: 'json', fields: ['time_place','part_req','invalid_bid','objection','bid_process'] },
+  signingProcess: { output: 'json', fields: ['bid_notice','contract_sign','performance_bond','contract_text'] },
+  terminationCondition: { output: 'json', fields: ['breach_termination','force_majeure','contract_termination','dispute_resolution'] },
+  evaluationBid: { output: 'json', fields: ['committee','duties','scoring','method','principles','others'] },
+  responseFileRequirements: { output: 'markdown' },
+  qualificationReview: { output: 'markdown' },
+  complianceCheck: { output: 'markdown' },
+  discardedBids: { output: 'markdown' },
+  procurementList: { output: 'markdown' },
+  businessScoring: { output: 'markdown' },
+};
+
+const OPTIONAL_BUNDLE_INSTRUCTIONS = {
+  responseFileRequirements: '提取响应/投标文件组成、固定模板、签字盖章、文件格式、份数、密封/上传/递交、偏离表及提交节点等要求，不要编造最终响应内容。',
+  qualificationReview: '提取投标人资格条件、资格审查材料、资质、业绩、人员等要求；没有提及就写“没有提及”。',
+  complianceCheck: '提取文件完整性、有效性、规范、偏差处理和实质性响应等符合性要求；没有提及就写“没有提及”。',
+  discardedBids: '提取无效投标、否决投标、废标情形及高风险遗漏项；明确项与经验补充应区分；不要泛化罗列。',
+  procurementList: '提取采购清单/采购需求、名称、规格、数量、参数、交付、验收、质保等实际出现的信息；尽量保持原始字段含义。',
+  businessScoring: '提取商务评分因素，为商务响应编写提供直接依据；不要提取无关技术内容。',
+  agentInfo: '提取代理机构名称、地址、联系人、电话、邮箱及银行账户相关信息。',
+  keyInfo: '提取公告、文件获取、递交、截止、开标等关键时间节点和地点。',
+  marginInfo: '提取投标保证金金额、缴纳方式、截止、退还、不予退还及注意事项。',
+  openBid: '提取开标时间地点、参与要求、无效标认定、异议处理、开标流程。',
+  evaluationBid: '提取评标委员会、职责、评分构成、评标方法、评标原则及其他评标信息。',
+  signingProcess: '提取中标公示、合同签订、履约保证金、合同文本等流程信息。',
+  terminationCondition: '提取违约解除、不可抗力、合同终止、争议解决等条件。',
+};
+
+
+
 function waitForPromptCacheWarmup() {
   return new Promise((resolve) => setTimeout(resolve, PROMPT_CACHE_WARMUP_DELAY_MS));
 }
@@ -254,6 +310,59 @@ function buildTenderAnalysisBundleContext(fileContent, taskIds, sectionHint, ten
     : source;
 }
 
+function buildOptionalBidAnalysisBundleMessages(fileContent, taskIds, sectionHint, tenderContextIndex) {
+  const context = buildTenderAnalysisBundleContext(fileContent, taskIds, sectionHint, tenderContextIndex);
+  const specs = taskIds.map((taskId) => {
+    const spec = OPTIONAL_BUNDLE_SCHEMAS[taskId] || { output: 'markdown' };
+    if (spec.output === 'json') {
+      return `"${taskId}": {${spec.fields.map((field) => `"${field}":"对应字段值"`).join(',')}}`;
+    }
+    return `"${taskId}":"Markdown 整理结果"`;
+  }).join(',\n');
+  const instructions = taskIds
+    .map((taskId) => `【${taskId}】${OPTIONAL_BUNDLE_INSTRUCTIONS[taskId] || ''}`)
+    .join('\n');
+  return [
+    {
+      role: 'system',
+      content: stableSystemPrompt + '\n\n本次合并多个招标解析项。每个字段必须只基于招标文件上下文返回；没有提及的字段写“没有提及”。',
+    },
+    { role: 'user', content: '相关招标文件上下文：\n' + context },
+    { role: 'user', content: '任务要求：\n' + instructions },
+    { role: 'user', content: `只返回合法 JSON，顶层只能包含以下键，每个键都必须存在：\n{
+${specs}
+}` },
+  ];
+}
+
+function normalizeOptionalBidAnalysisBundle(value, taskIds) {
+  const source = value?.result && typeof value.result === 'object' ? value.result : value || {};
+  const normalized = {};
+  for (const taskId of taskIds) {
+    const spec = OPTIONAL_BUNDLE_SCHEMAS[taskId] || { output: 'markdown' };
+    if (!(taskId in source)) {
+      throw new Error(`合并招标解析结果缺少字段：${taskId}`);
+    }
+    if (spec.output === 'markdown') {
+      const content = String(source[taskId] || '').trim();
+      normalized[taskId] = content || MARKDOWN_MISSING_RESULT;
+      continue;
+    }
+    if (!source[taskId] || typeof source[taskId] !== 'object' || Array.isArray(source[taskId])) {
+      throw new Error(`合并招标解析结果 ${taskId} 必须是对象`);
+    }
+    const item = {};
+    for (const field of spec.fields) {
+      if (!(field in source[taskId])) {
+        throw new Error(`合并招标解析结果 ${taskId} 缺少 ${field}`);
+      }
+      item[field] = String(source[taskId][field] ?? '没有提及').trim() || '没有提及';
+    }
+    normalized[taskId] = JSON.stringify(item);
+  }
+  return normalized;
+}
+
 function buildKeyBidAnalysisBundleMessages(fileContent, taskIds, sectionHint, tenderContextIndex) {
   const context = buildTenderAnalysisBundleContext(fileContent, taskIds, sectionHint, tenderContextIndex);
   return [
@@ -428,6 +537,27 @@ async function runBidAnalysisPromptTaskOnce({ aiService, fileContent, fileSegmen
     taskLabel: task.label,
     logTitle: `招标解析合并-${task.label}`,
   });
+}
+
+async function runOptionalBidAnalysisBundle({ aiService, fileContent, taskIds, sectionHint, tenderContextIndex, logTitle, batchId }) {
+  const messages = buildOptionalBidAnalysisBundleMessages(fileContent, taskIds, sectionHint, tenderContextIndex);
+  const result = await aiService.collectJsonResponse({
+    messages,
+    logTitle: logTitle || `招标解析合并-${batchId}`,
+    stage: 'tender-analysis',
+    batchId,
+    progressLabel: '招标解析合并',
+    failureMessage: '模型返回的合并招标解析结果格式无效',
+    normalizer: (value) => normalizeOptionalBidAnalysisBundle(value, taskIds),
+    validator: (value) => {
+      if (!value || typeof value !== 'object') throw new Error('合并招标解析结果为空');
+      taskIds.forEach((taskId) => {
+        if (!(taskId in value)) throw new Error(`合并结果缺少 ${taskId}`);
+      });
+    },
+    max_retries: 1,
+  });
+  return result;
 }
 
 async function runKeyBidAnalysisBundle({ aiService, fileContent, sectionHint, tenderContextIndex, logTitle }) {
@@ -681,22 +811,69 @@ async function runBidAnalysisTask({ aiService, workspaceStore, updateTask, check
     }
   }
 
+  async function runOptionalBundleGroup(bundleId, taskGroup) {
+    if (!taskGroup.length) return true;
+    taskGroup.forEach((task) => {
+      const runningItem = { id: task.id, label: task.label, status: 'running', content: '' };
+      currentTasks = { ...currentTasks, [task.id]: runningItem };
+    });
+    checkpointTask(
+      { status: 'running', progress: doneProgress(currentTasks), logs: [`开始合并招标解析：${bundleId}` ] },
+      { bidAnalysisTasks: currentTasks, bidAnalysisProgress: doneProgress(currentTasks) },
+    );
+    try {
+      const taskIds = taskGroup.map((task) => task.id);
+      const result = await runOptionalBidAnalysisBundle({
+        aiService,
+        fileContent,
+        taskIds,
+        sectionHint,
+        tenderContextIndex,
+        batchId: `tender-${bundleId}`,
+        logTitle: `招标解析合并-${bundleId}`,
+      });
+      for (const task of taskGroup) {
+        const completedItem = {
+          id: task.id,
+          label: task.label,
+          status: 'success',
+          content: String(result[task.id] || MARKDOWN_MISSING_RESULT).trim(),
+        };
+        currentTasks = { ...currentTasks, [task.id]: completedItem };
+      }
+      checkpointBidItem(
+        { status: 'running', progress: doneProgress(currentTasks) },
+        currentTasks[taskGroup[taskGroup.length - 1].id],
+        doneProgress(currentTasks),
+      );
+      return true;
+    } catch (error) {
+      taskGroup.forEach((task) => handleTaskError(task, error));
+      return false;
+    }
+  }
+
   const requiredTaskIds = new Set(['projectOverview', 'techRequirements', 'projectInfo', 'partAInfo', 'deliveryAndServiceRequirements']);
   const keyBundleTasks = tasksToRun.filter((task) => requiredTaskIds.has(task.id));
   const remainingTasks = tasksToRun.filter((task) => !requiredTaskIds.has(task.id));
   if (keyBundleTasks.length === requiredTaskIds.size) {
-    const bundleSucceeded = await runKeyTasksBundle(keyBundleTasks);
-    if (bundleSucceeded && remainingTasks.length) {
-      updateTask({
-        status: 'running',
-        progress: doneProgress(currentTasks),
-        logs: ['关键解析合并完成，开始并发处理其余解析项。'],
-      });
-    }
+    await runKeyTasksBundle(keyBundleTasks);
   } else if (keyBundleTasks.length) {
     await Promise.all(keyBundleTasks.map(runOneSafely));
   }
-  await Promise.all(remainingTasks.map(runOneSafely));
+
+  const remainingSet = new Set(remainingTasks.map((task) => task.id));
+  const bundledTaskIds = new Set();
+  for (const [bundleId, bundleIds] of OPTIONAL_BID_ANALYSIS_BUNDLES) {
+    const group = remainingTasks.filter((task) => bundleIds.includes(task.id));
+    if (group.length === bundleIds.length) {
+      group.forEach((task) => bundledTaskIds.add(task.id));
+      await runOptionalBundleGroup(bundleId, group);
+    }
+  }
+
+  const residualTasks = remainingTasks.filter((task) => !bundledTaskIds.has(task.id));
+  await Promise.all(residualTasks.map(runOneSafely));
 
   const missingRequiredTasks = getMissingRequiredTasks(currentTasks);
   if (missingRequiredTasks.length) {
