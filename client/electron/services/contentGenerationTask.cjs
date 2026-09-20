@@ -1826,13 +1826,34 @@ function applyConsistencyRepairPatches(content, patches) {
   return { content: nextContent, appliedCount, errors, patchResults };
 }
 
+function compactConsistencyAuditContent(content, maxChars = 5000) {
+  const source = String(content || '').trim();
+  if (!source || source.length <= maxChars) return source;
+  const lines = normalizeNewlines(source).split('\n');
+  const riskPattern = /(\d|%|日期|时间|周期|期限|工期|质保|售后|验收|人员|项目经理|负责人|设备|型号|规格|参数|数量|功率|金额|预算|标准|规范|地点|地址|电话|合同|付款|培训|响应|安全|应急|保险|业绩|资质|证书|品牌)/;
+  const selected = [];
+  const seen = new Set();
+  const push = (line) => {
+    const value = String(line || '').trim();
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    selected.push(value);
+  };
+  lines.slice(0, 3).forEach(push);
+  lines.forEach((line) => { if (riskPattern.test(line)) push(line); });
+  lines.slice(-3).forEach(push);
+  let result = selected.join('\n');
+  if (result.length > maxChars) result = compactPromptText(result, maxChars);
+  return result;
+}
+
 function formatConsistencyAuditGroupContent(group) {
   return (group.items || []).map((entry) => `<section>
 编号：${entry.item.id || 'unknown'}
 标题：${entry.item.title || '未命名章节'}
 路径：${formatChapterPath(entry)}
-正文：
-${entry.content || ''}
+正文（保留事实敏感行及首尾上下文）：
+${compactConsistencyAuditContent(entry.content, 5000)}
 </section>`).join('\n\n');
 }
 
