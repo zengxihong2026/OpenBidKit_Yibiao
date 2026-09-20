@@ -1271,7 +1271,8 @@ function buildAgentOriginalMaterialRestorePrompt() {
 workspace 文件：
 - context.md：招标文件关键信息和全局事实变量标题清单。
 - restore-targets.md：当前可还原叶子节点，包含 node_id、标题、描述、上级章节和同级章节。
-- original-segments.md：原方案段落，包含 source_id、标题路径、字符数和原文。
+- original-segments-index.md：原方案段落索引，只包含 source_id、标题路径、字符数和对应分片文件。
+- original-segments/part-*.md：按批次存放原方案原文；先根据索引定位，再按需读取相关分片，避免一次性读取全部原文。
 
 工作要求：
 1. 你可以分批读取、建立索引和创建临时草稿，但最终只写入 original-restore-result.json。
@@ -1292,7 +1293,8 @@ workspace 文件：
 }
 
 function buildAgentOriginalMaterialRestoreFiles({ targets, originalSegments, projectOverview, bidAnalysisFactsText, globalFactTitlesText }) {
-  return [
+  const batchSize = 20;
+  const files = [
     {
       path: 'context.md',
       content: `# 招标文件关键信息
@@ -1306,12 +1308,27 @@ ${globalFactTitlesText || '未提供'}`,
       content: `# 当前可还原叶子节点
 ${formatRestoreTargetsForPrompt(targets) || '无'}`,
     },
-    {
-      path: 'original-segments.md',
-      content: `# 原方案段落
-${formatOriginalSegmentsForPrompt(originalSegments)}`,
-    },
   ];
+
+  const indexLines = ['# 原方案段落索引'];
+  for (let start = 0, batch = 1; start < (originalSegments || []).length; start += batchSize, batch += 1) {
+    const group = originalSegments.slice(start, start + batchSize);
+    const path = `original-segments/part-${String(batch).padStart(3, '0')}.md`;
+    for (const segment of group) {
+      indexLines.push(`- ${segment.id} | ${segment.chars || String(segment.content || '').length}字 | ${segment.title_path?.join(' > ') || '未识别标题'} | ${path}`);
+    }
+    files.push({
+      path,
+      content: group.map((segment) => `<original_segment id="${segment.id}">
+标题路径：${segment.title_path?.length ? segment.title_path.join(' > ') : '未识别标题'}
+字符数：${segment.chars || String(segment.content || '').length}
+原文：
+${segment.content}
+</original_segment>`).join('\n\n'),
+    });
+  }
+  files.splice(2, 0, { path: 'original-segments-index.md', content: indexLines.join('\n') });
+  return files;
 }
 
 function buildAgentRestoredChapterContentPrompt(globalFactsMode) {
