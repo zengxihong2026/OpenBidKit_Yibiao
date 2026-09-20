@@ -5301,8 +5301,9 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     return `请在当前工作目录中完成原方案覆盖修复，让 technical-plan.md 成为程序可继续解析和回写的最终正文文件。
 
 workspace 文件说明：
-- original-coverage-sources.md：每个章节对应需要保留的来源段，是判断原方案核心内容是否已保留的依据。
-- technical-plan.md：当前技术方案正文，包含章节标题、section id 和 yibiao-section-start / yibiao-section-end 标记。
+- original-coverage-sources.md：原方案覆盖来源索引。
+- original-coverage-sources/section-*.md：每个目标小节对应的来源段，按需读取。
+- technical-plan.md：目标正文索引；完整正文位于 technical-plan/section-*.md。
 
 任务目标：
 检查并修复 technical-plan.md，使各章节正文尽量保留 original-coverage-sources.md 中对应来源段的实质内容。
@@ -5486,8 +5487,8 @@ workspace 文件说明：
 
     updateAgentOriginalCoverageProgress(1, '准备原方案覆盖 Agent 输入文件');
     const files = [
-      { path: 'original-coverage-sources.md', content: buildAgentOriginalCoverageSourcesMarkdown(coverageTargets) },
-      { path: 'technical-plan.md', content: buildAgentTechnicalPlanMarkdown(sectionIndex) },
+      ...buildAgentOriginalCoverageSourceFiles(coverageTargets),
+      ...buildAgentTechnicalPlanFiles(sectionIndex),
     ];
     pauseIfRequested('正文生成已在原方案覆盖 Agent 修复开始前暂停，本次 Agent 未启动；继续后将重新执行。');
 
@@ -5914,6 +5915,51 @@ workspace 文件说明：
     return lines;
   }
 
+  function buildAgentTechnicalPlanFiles(sectionIndex) {
+    const indexLines = [
+      '# 技术方案正文索引',
+      '',
+      '完整正文按目标小节拆分到 technical-plan/section-*.md。先根据本索引定位需要检查的小节，再按需读取对应文件。最终输出仍必须写入 technical-plan.md，并包含所有目标小节的完整内容。',
+    ];
+    const files = [];
+    for (const [id, section] of sectionIndex.entries()) {
+      const safeId = String(id).replace(/[^A-Za-z0-9._-]/g, '_');
+      const path = `technical-plan/section-${safeId}.md`;
+      indexLines.push(`- ${id} ${singleLine(section.item?.title || '未命名章节')}：${path}`);
+      files.push({
+        path,
+        content: `<!-- yibiao-section-start id="${id}" -->
+${String(section.originalContent || '').trim()}
+<!-- yibiao-section-end id="${id}" -->`,
+      });
+    }
+    return [{ path: 'technical-plan.md', content: indexLines.join('\n') }, ...files];
+  }
+
+  function buildAgentOriginalCoverageSourceFiles(targets) {
+    const indexLines = [
+      '# 原方案覆盖来源索引',
+      '',
+      '每个目标小节对应一个来源文件。先根据索引定位，再按需读取对应来源文件。',
+    ];
+    const files = [];
+    for (const target of targets || []) {
+      const id = String(target.item?.id || 'unknown').replace(/[^A-Za-z0-9._-]/g, '_');
+      const path = `original-coverage-sources/section-${id}.md`;
+      indexLines.push(`- ${target.item?.id || 'unknown'} ${singleLine(target.item?.title || '未命名章节')}：${path}`);
+      files.push({
+        path,
+        content: [
+          `# ${target.item?.id || 'unknown'} ${target.item?.title || '未命名章节'}`,
+          `章节路径：${formatChapterPath(target)}`,
+          '需要保留的来源段：',
+          formatOriginalCoverageSources(target.sources) || '未提供',
+        ].join('\n\n'),
+      });
+    }
+    return [{ path: 'original-coverage-sources.md', content: indexLines.join('\n') }, ...files];
+  }
+
   function buildAgentTechnicalPlanMarkdown(sectionIndex) {
     const lines = ['# 技术方案正文', ''];
     renderAgentTechnicalPlanOutline(outlineData.outline || [], sectionIndex, 1, lines);
@@ -5934,7 +5980,8 @@ workspace 文件说明：
 
 workspace 文件说明：
 - global-facts.md：全局事实变量、Step02 关键解析结果和需要保持一致的项目信息。
-- technical-plan.md：当前技术方案正文全文，包含章节标题、section id 和 yibiao-section-start / yibiao-section-end 标记。
+- technical-plan.md：目标正文索引；完整目标小节位于 technical-plan/section-*.md。
+- technical-plan/section-*.md：目标小节正文文件，按需读取。
 
 任务目标：
 审计并修复 technical-plan.md，使正文不与 global-facts.md 中的全局事实变量冲突，并尽量消除正文前后矛盾。
@@ -6065,7 +6112,7 @@ workspace 文件说明：
     updateAgentConsistencyProgress(1, '准备 Agent 输入文件');
     const files = [
       { path: 'global-facts.md', content: buildAgentGlobalFactsMarkdown() },
-      { path: 'technical-plan.md', content: buildAgentTechnicalPlanMarkdown(sectionIndex) },
+      ...buildAgentTechnicalPlanFiles(sectionIndex),
     ];
     pauseIfRequested('正文生成已在 Agent 全文一致性修复开始前暂停，本次 Agent 未启动；继续后将重新执行 Agent 修复。');
 
