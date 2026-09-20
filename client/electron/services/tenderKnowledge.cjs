@@ -58,7 +58,7 @@ function buildTenderKnowledgeSnapshot({
   tenderMarkdown = '',
   bidAnalysisTasks = {},
   projectOverview = '',
-  maxCategoryChars = 1800,
+  maxCategoryChars = 1400,
 } = {}) {
   const categories = {};
   const bidFacts = buildBidAnalysisFactIndex(bidAnalysisTasks);
@@ -97,7 +97,7 @@ function buildTenderKnowledgeSnapshot({
   };
 }
 
-function formatTenderKnowledgeForPrompt(snapshot, maxChars = 6500) {
+function formatTenderKnowledgeForPrompt(snapshot, maxChars = 5000) {
   const source = snapshot?.categories || {};
   const labels = {
     scope: '项目范围与目标',
