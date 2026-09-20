@@ -3969,6 +3969,131 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     return storedContentPlans;
   }
 
+  function chunkPlanningTargets(targets, size = CONTENT_PLAN_BATCH_SIZE) {
+    const result = [];
+    for (let index = 0; index < targets.length; index += size) {
+      result.push(targets.slice(index, index + size));
+    }
+    return result;
+  }
+
+  function buildChapterContentPlanBatchMessages(contexts) {
+    const rows = contexts.map(({ item, parentChapters, siblingChapters }) => {
+      const siblingText = (siblingChapters || [])
+        .filter((sibling) => sibling.id !== item.id)
+        .slice(0, 8)
+        .map((sibling) => `- ${sibling.id || 'unknown'} ${singleLine(sibling.title || '未命名章节')}：${compactPromptText(sibling.description || '', 500)}`)
+        .join('\n');
+      const parentText = (parentChapters || [])
+        .slice(-4)
+        .map((parent) => `- ${parent.id || 'unknown'} ${singleLine(parent.title || '未命名章节')}：${compactPromptText(parent.description || '', 700)}`)
+        .join('\n');
+      return [
+        `## ${item.id || 'unknown'} ${singleLine(item.title || '未命名章节')}`,
+        `章节描述：${compactPromptText(item.description || '', 1200)}`,
+        parentText ? `上级章节：\n${parentText}` : '',
+        siblingText ? `同级章节：\n${siblingText}` : '',
+      ].filter(Boolean).join('\n');
+    }).join('\n\n');
+
+    const tableRequirementLabel = TABLE_REQUIREMENT_LABELS[tableRequirement] || TABLE_REQUIREMENT_LABELS.heavy;
+    return [
+      {
+        role: 'system',
+        content: `你是投标技术方案正文编排助手。现在需要一次性为多个叶子小节做“编排决策”，以减少重复上下文输入。
+
+要求：
+1. 只返回 JSON，不要解释。
+2. 顶层对象只有 plans 数组；每个 plan 必须有 section_id、writing_focus、knowledge.item_ids、facts.titles、table.needed、table.purpose。
+3. section_id 必须逐字使用下方当前批次的小节 ID，不能遗漏、不能新增。
+4. knowledge.item_ids 只能从参考知识库轻量条目的 id 中选择，最多选择 ${CONTENT_KNOWLEDGE_TOP_K} 条。
+5. facts.titles 只能从全局事实变量标题清单中选择，最多选择 ${CONTENT_FACT_TITLE_MAX} 组。
+6. writing_focus 只写 1-2 句话，聚焦当前章节，不编造具体承诺。
+7. table.needed 依据表格需求“${tableRequirementLabel}”判断，禁止为了形式硬插。`,
+      },
+      { role: 'user', content: `参考知识库轻量条目：\n${renderKnowledgeItemsForPrompt(knowledgeItems)}` },
+      { role: 'user', content: `招标文件关键信息：\n${compactPromptText(formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText), 7000)}` },
+      { role: 'user', content: `Step04 全局事实变量标题清单：\n${globalFactTitlesText || '未提供'}` },
+      { role: 'user', content: `当前批次小节：\n${rows}` },
+      { role: 'user', content: `请严格返回：
+{
+  "plans": [
+    {
+      "section_id": "1.1",
+      "writing_focus": "本节重点……",
+      "knowledge": { "item_ids": [] },
+      "facts": { "titles": [] },
+      "table": { "needed": false, "purpose": "" }
+    }
+  ]
+}\n注意：plans 必须覆盖本批次全部 section_id。` },
+    ];
+  }
+
+  function normalizeContentPlanBatchResponse(value, contexts) {
+    const source = value?.plans && Array.isArray(value.plans) ? value.plans : (Array.isArray(value) ? value : []);
+    const byId = new Map();
+    for (const raw of source) {
+      const id = singleLine(raw?.section_id || raw?.sectionId || raw?.node_id || raw?.nodeId);
+      if (id) byId.set(id, raw);
+    }
+    return contexts.map(({ item }) => ({
+      section_id: item.id,
+      plan: normalizeContentPlan(byId.get(item.id) || {}, allowedKnowledgeItemIds, allowedFactTitles),
+    }));
+  }
+
+  function validateContentPlanBatchResponse(value, contexts) {
+    if (!value || !Array.isArray(value)) throw new Error('正文批量编排结果必须是数组');
+    const allowedIds = new Set(contexts.map(({ item }) => item.id));
+    const seen = new Set();
+    for (const entry of value) {
+      const id = singleLine(entry?.section_id);
+      if (!id || !allowedIds.has(id) || seen.has(id)) {
+        throw new Error(`正文批量编排结果 section_id 无效或重复：${id || '空'}`);
+      }
+      seen.add(id);
+      validateContentPlan(entry.plan);
+    }
+    if (seen.size !== allowedIds.size) {
+      throw new Error(`正文批量编排结果缺少小节：期望 ${allowedIds.size}，实际 ${seen.size}`);
+    }
+  }
+
+  async function planBatch(contexts) {
+    if (!contexts.length) return;
+    const batchId = `content-plan-${Date.now()}-${contexts[0].item.id}`;
+    const results = await aiService.collectJsonResponse({
+      messages: buildChapterContentPlanBatchMessages(contexts),
+      logTitle: `正文批量编排-${contexts[0].item.id}-${contexts[contexts.length - 1].item.id}`,
+      progressLabel: '正文批量编排',
+      stage: 'content-planning',
+      batchId,
+      failureMessage: '模型返回的正文批量编排结果格式无效',
+      normalizer: (value) => normalizeContentPlanBatchResponse(value, contexts),
+      validator: (value) => validateContentPlanBatchResponse(value, contexts),
+      max_retries: 1,
+    });
+
+    for (const context of contexts) {
+      const item = context.item;
+      const entry = results.find((row) => row.section_id === item.id);
+      let contentPlan = entry?.plan || normalizeContentPlan({}, allowedKnowledgeItemIds, allowedFactTitles);
+      if (tableRequirement === 'none') contentPlan = clearContentPlanTable(contentPlan);
+      contentPlans.set(item.id, contentPlan);
+      storedContentPlans = pruneContentGenerationPlans({
+        ...storedContentPlans,
+        [item.id]: createStoredContentPlan(contentPlan, tableRequirement),
+      }, leaves);
+      contentStats.planning_completed += 1;
+      logs = [...logs, `编排完成：${item.id} ${item.title || '未命名章节'}（批次：${batchId}）`];
+    }
+    const runtime = syncRuntime();
+    checkpointTask({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() }, {
+      contentGenerationPlans: storedContentPlans,
+      contentGenerationRuntime: runtime,
+    }, { contentRuntime: runtime });
+  }
   async function planOne(context, { preservedOriginalMaterial } = {}) {
     const { item, parentChapters, siblingChapters } = context;
     let contentPlan;
@@ -3990,6 +4115,8 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         }),
         logTitle: `正文编排-${item.id}-${item.title || '未命名章节'}`,
         progressLabel: '正文编排决策',
+        stage: 'content-planning',
+        sectionId: item.id,
         failureMessage: '模型返回的正文编排决策格式无效',
         normalizer: (value) => normalizeContentPlan(value, allowedKnowledgeItemIds, allowedFactTitles),
         validator: validateContentPlan,
@@ -4046,18 +4173,22 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
 
     if (planningTargets.length) {
-      const [warmupTarget, ...remainingPlanningTargets] = planningTargets;
-      logs = [...logs, `开始正文编排预热：${warmupTarget.item.id} ${warmupTarget.item.title || '未命名章节'}。`];
+      const planningBatches = chunkPlanningTargets(planningTargets);
+      logs = [...logs, `批量正文编排：${planningTargets.length} 个小节合并为 ${planningBatches.length} 个批次，每批最多 ${CONTENT_PLAN_BATCH_SIZE} 个。`];
       publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
 
-      await planOne(warmupTarget);
-      pauseIfRequested('正文生成已在编排预热后暂停，可导出当前已完成内容，稍后继续。');
+      await planBatch(planningBatches[0]);
+      pauseIfRequested('正文生成已在批量编排预热后暂停，可导出当前已完成内容，稍后继续。');
 
-      if (remainingPlanningTargets.length) {
-        continueAfterPromptCacheWarmup(`正文编排预热完成，开始并发编排剩余 ${remainingPlanningTargets.length} 个小节。`);
-        logs = [...logs, `开始并发编排剩余 ${remainingPlanningTargets.length} 个小节。`];
-        publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
-        await runItemsWithWorkerPool(remainingPlanningTargets, contentConcurrency, planOne, isPauseRequested);
+      if (planningBatches.length > 1) {
+        continueAfterPromptCacheWarmup(`正文批量编排预热完成，开始并发处理剩余 ${planningBatches.length - 1} 个批次。`);
+        const remainingPlanningBatches = planningBatches.slice(1);
+        await runItemsWithWorkerPool(
+          remainingPlanningBatches,
+          Math.max(1, Math.min(contentConcurrency, 3)),
+          (batch) => planBatch(batch),
+          isPauseRequested,
+        );
       }
     }
     pauseIfRequested('正文生成已在编排阶段暂停，可导出当前已完成内容，稍后继续。');
@@ -4500,6 +4631,8 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
       }),
       logTitle: `正文${options.mode === 'expand' ? '扩写' : '缩写'}-${item.id}-${item.title || '未命名章节'}`,
       progressLabel: '正文字数调整',
+      stage: 'word-adjustment',
+      sectionId: item.id,
       failureMessage: '模型返回的正文字数调整结果格式无效',
       max_retries: 0,
       normalizer: normalizeWordAdjustmentResponse,
@@ -5907,7 +6040,17 @@ workspace 文件说明：
       return { ran: false, fixedCount: 0, failedCount: 0 };
     }
 
-    const auditTargets = buildConsistencyAuditTargets(options.targetItemId || targetItemId);
+    const rawAuditTargets = buildConsistencyAuditTargets(options.targetItemId || targetItemId);
+    const auditMode = String(
+      options.consistencyAuditMode
+      || options.consistency_audit_mode
+      || generationOptions.consistencyAuditMode
+      || generationOptions.consistency_audit_mode
+      || 'risk-based'
+    ).trim() || 'risk-based';
+    const auditTargets = selectConsistencyAuditTargets(rawAuditTargets, {
+      mode: (options.targetItemId || targetItemId) ? 'full' : auditMode,
+    });
     if (!auditTargets.length) {
       writeDeveloperLog('consistency.audit.skipped', { reason: 'no_targets', target_item_id: options.targetItemId || targetItemId || '' });
       logs = [...logs, '全文一致性审计跳过：没有可审计的成功正文小节。'];
@@ -5933,7 +6076,7 @@ workspace 文件说明：
     contentStats.audit_agent_step_label = '';
     contentStats.audit_agent_changed_sections = 0;
     contentStats.audit_agent_failed_sections = 0;
-    logs = [...logs, `开始全文一致性审计：${auditTargets.length} 个小节，拆分为 ${auditGroups.length} 组，并发 ${contentConcurrency}。`];
+    logs = [...logs, `开始全文一致性审计：原始 ${rawAuditTargets.length} 个小节，实际审计 ${auditTargets.length} 个小节，模式 ${auditMode}，拆分为 ${auditGroups.length} 组，并发 ${contentConcurrency}。`];
     const auditRuntime = syncRuntime({ phase: 'auditing' });
     writeDeveloperLog('consistency.audit.start', {
       target_item_id: options.targetItemId || targetItemId || '',
@@ -5971,6 +6114,8 @@ workspace 文件说明：
         const response = await aiService.collectJsonResponse({
           messages: buildConsistencyAuditMessages({ group, globalFactsText, bidAnalysisFactsText, globalFactsMode }),
           logTitle: `一致性审计-${group.index}-${group.total}`,
+          stage: 'consistency',
+          batchId: `consistency-${group.index}-${group.total}`,
           progressLabel: '全文一致性审计',
           failureMessage: '模型返回的一致性审计结果格式无效',
           normalizer: (value) => normalizeConsistencyAuditResponse(value, allowedIds),
