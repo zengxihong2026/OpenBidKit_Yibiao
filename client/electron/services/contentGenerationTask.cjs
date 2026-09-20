@@ -865,6 +865,52 @@ function validateTableCleanupResponse(value) {
   }
 }
 
+function scoreKnowledgeItemRelevance(item, query) {
+  const keywords = extractLocalPromptKeywords(query);
+  const text = `${item?.title || ''}\n${item?.resume || ''}`.toLowerCase();
+  return keywords.reduce((score, keyword) => {
+    if (!keyword) return score;
+    const hits = text.split(keyword).length - 1;
+    return score + Math.min(6, hits * 2);
+  }, 0);
+}
+
+function extractLocalPromptKeywords(value) {
+  const source = String(value || '').toLowerCase();
+  const cjkRuns = source.match(/[\u4e00-\u9fff]{2,}/g) || [];
+  const keywords = [];
+  for (const run of cjkRuns) {
+    for (let size = 2; size <= Math.min(4, run.length); size += 1) {
+      for (let index = 0; index + size <= run.length; index += 1) {
+        keywords.push(run.slice(index, index + size));
+      }
+    }
+  }
+  const latin = source.match(/[a-z0-9][a-z0-9._/-]{1,}/g) || [];
+  return [...new Set([...keywords, ...latin].filter((item) => item.length >= 2))];
+}
+
+function selectRelevantKnowledgeItems(items, query, options = {}) {
+  const maxItems = Math.max(1, Number(options.maxItems) || 80);
+  const maxChars = Math.max(1000, Number(options.maxChars) || 12000);
+  const source = (items || []).filter((item) => item?.id && item?.title && item?.resume);
+  const ranked = source
+    .map((item, index) => ({ item, index, score: scoreKnowledgeItemRelevance(item, query) }))
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
+  const selected = [];
+  let chars = 2;
+  for (const entry of ranked) {
+    if (selected.length >= maxItems) break;
+    const value = entry.item;
+    const lineChars = String(value.title || '').length + String(value.resume || '').length + 48;
+    if (selected.length && chars + lineChars > maxChars) continue;
+    selected.push(value);
+    chars += lineChars;
+  }
+  return selected;
+}
+
 function renderKnowledgeItemsForPrompt(items) {
   return JSON.stringify((items || []).map((item) => ({
     id: String(item.id || '').trim(),
@@ -903,8 +949,14 @@ function buildChapterContentPlanMessages({ chapter, parentChapters, siblingChapt
 
   messages.push({
     role: 'user',
-    content: `参考知识库轻量条目（只包含 id、标题和简介，不包含正文；如无合适条目，knowledge.item_ids 返回空数组）：
-${renderKnowledgeItemsForPrompt(knowledgeItems)}`,
+    content: `参考知识库轻量条目（只包含 id、标题和简介；已按当前章节相关性裁剪）：
+${renderKnowledgeItemsForPrompt(
+      selectRelevantKnowledgeItems(
+        knowledgeItems,
+        `${chapterTitle} ${chapterDescription}`,
+        { maxItems: 60, maxChars: 9000 },
+      ),
+    )}`,
   });
 
   messages.push({ role: 'user', content: `招标文件关键信息（用于判断正文需要引用哪些事实）：\n${formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText)}` });
@@ -4082,7 +4134,13 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
 6. writing_focus 只写 1-2 句话，聚焦当前章节，不编造具体承诺。
 7. table.needed 依据表格需求“${tableRequirementLabel}”判断，禁止为了形式硬插。`,
       },
-      { role: 'user', content: `参考知识库轻量条目：\n${renderKnowledgeItemsForPrompt(knowledgeItems)}` },
+      { role: 'user', content: `参考知识库轻量条目（已按本批次小节相关性裁剪）：\n${renderKnowledgeItemsForPrompt(
+        selectRelevantKnowledgeItems(
+          knowledgeItems,
+          contexts.map(({ item }) => `${item.title || ''} ${item.description || ''}`).join('\n'),
+          { maxItems: 80, maxChars: 12000 },
+        ),
+      )}` },
       { role: 'user', content: `招标文件关键信息：\n${compactBidKeyInfoText || '未提供'}` },
       { role: 'user', content: `Step04 全局事实变量标题清单：\n${globalFactTitlesText || '未提供'}` },
       { role: 'user', content: `当前批次小节：\n${rows}` },
