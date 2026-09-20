@@ -14,6 +14,8 @@ const text = [
 
 const keywords = extractKeywords('工期 验收 项目周期');
 assert.ok(keywords.includes('工期'));
+const semanticResult = retrieveTenderContext(text, '施工组织设计与工期安排', { maxSnippets: 2, maxChars: 1200 });
+assert.ok(semanticResult.snippets.length >= 1);
 
 const result = retrieveTenderContext(text, '工期 验收', { maxSnippets: 2, maxChars: 1200 });
 assert.ok(result.snippets.length >= 1);
