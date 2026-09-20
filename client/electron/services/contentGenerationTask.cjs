@@ -4561,7 +4561,6 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         }, { logs });
         restoredCount += 1;
       }
-        }
       }
     }
 
