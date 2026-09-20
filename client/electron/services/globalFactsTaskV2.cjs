@@ -136,10 +136,16 @@ function collectTenderSourceFiles(workspaceStore, storedPlan) {
   return readWorkingCopySource(workspaceStore, storedPlan.tenderFile?.fileName || '招标文件', false);
 }
 
+function compactKnowledgeItemContent(content, maxChars = 4500) {
+  const text = String(content || '').trim();
+  if (!text || text.length <= maxChars) return text;
+  return `${text.slice(0, Math.floor(maxChars * 0.72))}\n…（知识库正文按全局事实上下文预算压缩）…\n${text.slice(-Math.floor(maxChars * 0.2))}`.slice(0, maxChars);
+}
+
 function formatKnowledgeItemFile(item) {
   const title = String(item?.title || '知识库条目').trim();
   const resume = String(item?.resume || '').trim() || '无';
-  const content = String(item?.content || '').trim();
+  const content = compactKnowledgeItemContent(item?.content, 4500);
   return `# ${title}\n\n简介：${resume}\n\n${content}`.trim();
 }
 
@@ -357,11 +363,21 @@ async function runGlobalFactsTaskV2({
   if (sectionHint) {
     files.push({ path: '标段说明.md', content: sectionHint });
   }
+  let knowledgeChars = 0;
+  const knowledgeTotalLimit = 16000;
   knowledgeItems.forEach((item, index) => {
+    if (knowledgeChars >= knowledgeTotalLimit) return;
+    const content = formatKnowledgeItemFile(item);
+    const remaining = knowledgeTotalLimit - knowledgeChars;
+    const bounded = content.length > remaining
+      ? content.slice(0, remaining)
+      : content;
+    if (!bounded.trim()) return;
     files.push({
       path: `参考知识库/条目-${index + 1}.md`,
-      content: formatKnowledgeItemFile(item),
+      content: bounded,
     });
+    knowledgeChars += bounded.length;
   });
   if (originalPlanMarkdown) {
     files.push({ path: '原方案.md', content: originalPlanMarkdown });
