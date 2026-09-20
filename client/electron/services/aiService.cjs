@@ -23,6 +23,7 @@ const {
   writeAiLog,
 } = require('../utils/aiLog.cjs');
 const textTokenStatsStore = require('./textTokenStatsStore.cjs');
+const tokenUsageLedger = require('./tokenUsageLedger.cjs');
 const { normalizeTokenUsage } = textTokenStatsStore;
 
 const AI_REQUEST_TIMEOUT_MS = 600000;
@@ -104,16 +105,46 @@ function getTextTokenStatsSnapshot() {
   return textTokenStatsStore.getTextTokenStatsSnapshot();
 }
 
-function recordTextTokenStats(config, usage) {
+function recordTextTokenStats(config, usage, request = {}) {
   if (!config?.developer_mode) {
     return;
   }
 
   textTokenStatsStore.recordTextTokenStats(usage);
+  tokenUsageLedger.recordTokenUsageEvent({
+    requestId: request.requestId,
+    logTitle: request.logTitle,
+    stage: request.stage,
+    sectionId: request.sectionId,
+    batchId: request.batchId,
+    modelProvider: config.text_model_provider,
+    modelName: config.model_name,
+    requestMode: request.requestMode,
+    messages: request.messages,
+    retryCount: request.retryCount,
+  }, usage, {
+    success: request.success !== false,
+    durationMs: request.durationMs,
+    error: request.error,
+  });
 }
 
 function resetTextTokenStats() {
-  return textTokenStatsStore.resetTextTokenStats();
+  textTokenStatsStore.resetTextTokenStats();
+  tokenUsageLedger.resetLedger();
+  return textTokenStatsStore.getTextTokenStatsSnapshot();
+}
+
+function getTokenUsageLedger(options) {
+  return tokenUsageLedger.getLedgerSnapshot(options);
+}
+
+function onTokenUsageLedgerChanged(listener) {
+  return tokenUsageLedger.onLedgerChanged(listener);
+}
+
+function resetTokenUsageLedger() {
+  return tokenUsageLedger.resetLedger();
 }
 
 function onTextTokenStatsChanged(listener) {
@@ -1431,7 +1462,7 @@ async function chatWithConfig(app, config, request) {
     }, timeoutMs, request.signal));
 
     responseData = result.responseData;
-    recordTextTokenStats(config, result.usage);
+    recordTextTokenStats(config, result.usage, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, sectionId: request.sectionId, batchId: request.batchId, success: true });
     trackAiRequest(app, config, { ai_request_type: 'text', usage: result.usage });
     analyticsTracked = true;
     const content = result.content || '';
@@ -1452,7 +1483,7 @@ async function chatWithConfig(app, config, request) {
       ? request.timeout_message || `AI 请求超时（${timeoutMs / 1000} 秒）`
       : error.message;
     if (!analyticsTracked) {
-      recordTextTokenStats(config, null);
+      recordTextTokenStats(config, null, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, sectionId: request.sectionId, batchId: request.batchId, success: false, error: errorMessage });
       trackAiRequest(app, config, { ai_request_type: 'text' });
       analyticsTracked = true;
     }
@@ -1521,7 +1552,7 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
       requestId,
     });
     responseData = result?.responseData ?? null;
-    recordTextTokenStats(config, result?.usage);
+    recordTextTokenStats(config, result?.usage, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, sectionId: request.sectionId, batchId: request.batchId, success: true });
     trackAiRequest(app, config, { ai_request_type: 'text', usage: result?.usage });
     analyticsTracked = true;
     writeAiLog(app, config, {
@@ -1538,7 +1569,7 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
     return result;
   } catch (error) {
     if (!analyticsTracked) {
-      recordTextTokenStats(config, null);
+      recordTextTokenStats(config, null, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, sectionId: request.sectionId, batchId: request.batchId, success: false, error: error?.message || 'AI 请求失败' });
       trackAiRequest(app, config, { ai_request_type: 'text' });
     }
     writeAiLog(app, config, {
@@ -2537,6 +2568,18 @@ function createAiService({ app, configStore }) {
 
     onTextTokenStatsChanged(listener) {
       return onTextTokenStatsChanged(listener);
+    },
+
+    getTokenUsageLedger(options) {
+      return getTokenUsageLedger(options);
+    },
+
+    resetTokenUsageLedger() {
+      return resetTokenUsageLedger();
+    },
+
+    onTokenUsageLedgerChanged(listener) {
+      return onTokenUsageLedgerChanged(listener);
     },
 
     withQueueScope(scopeId, signal) {
