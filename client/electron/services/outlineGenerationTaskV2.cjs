@@ -502,14 +502,35 @@ function normalizeReferenceDocumentIds(storedPlan) {
   return Array.isArray(ids) ? [...new Set(ids.map((id) => String(id || '').trim()).filter(Boolean))] : [];
 }
 
+function compactKnowledgeMarkdown(markdown, maxChars = 6000) {
+  const text = String(markdown || '').trim();
+  if (!text || text.length <= maxChars) return text;
+  const lines = text.split(/\r?\n/);
+  const headings = lines.filter((line) => /^\s*#{1,6}\s+/.test(line)).slice(0, 80);
+  const head = text.slice(0, Math.floor(maxChars * 0.7));
+  const tail = text.slice(-Math.floor(maxChars * 0.2));
+  const headingIndex = headings.length ? `\n\n资料目录提示：\n${headings.join('\n')}` : '';
+  return `${head}\n…（参考资料已按目录阶段上下文预算压缩）…\n${tail}${headingIndex}`.slice(0, maxChars);
+}
+
 function buildKnowledgeFiles(knowledgeBaseService, documentIds) {
   if (!knowledgeBaseService?.readReferences) return [];
-  return knowledgeBaseService.readReferences(documentIds, { includeMarkdown: true, includeItems: false })
-    .map((reference, index) => ({
+  const references = knowledgeBaseService.readReferences(documentIds, { includeMarkdown: true, includeItems: false });
+  const files = [];
+  let totalChars = 0;
+  const totalLimit = 20000;
+  references.forEach((reference, index) => {
+    if (totalChars >= totalLimit) return;
+    const remaining = totalLimit - totalChars;
+    const compacted = compactKnowledgeMarkdown(reference?.markdown, Math.min(6000, remaining));
+    if (!compacted) return;
+    files.push({
       path: `参考知识库/参考资料-${index + 1}.md`,
-      content: String(reference?.markdown || '').trim(),
-    }))
-    .filter((file) => file.content);
+      content: compacted,
+    });
+    totalChars += compacted.length;
+  });
+  return files;
 }
 
 function createInitialPrompt(taskInstruction, { standaloneTechnical = false, noTechnicalScoreMode = false } = {}) {
