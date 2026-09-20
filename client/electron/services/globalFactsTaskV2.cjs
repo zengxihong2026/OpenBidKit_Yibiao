@@ -39,6 +39,51 @@ const GLOBAL_FACTS_JSON_SCHEMA = {
   },
 };
 
+function splitTenderAgentSource(markdown, maxChars = 10000) {
+  const source = String(markdown || '').trim();
+  if (!source) return [];
+  const lines = source.split(/\r?\n/);
+  const parts = [];
+  let buffer = [];
+  let chars = 0;
+  function flush() {
+    const text = buffer.join('\n').trim();
+    if (text) parts.push(text);
+    buffer = [];
+    chars = 0;
+  }
+  for (const line of lines) {
+    const lineChars = line.length + 1;
+    if (buffer.length && chars + lineChars > maxChars) flush();
+    buffer.push(line);
+    chars += lineChars;
+  }
+  flush();
+  return parts;
+}
+
+function buildTenderAgentFiles(tenderSources) {
+  const files = [];
+  for (const [index, source] of (tenderSources || []).entries()) {
+    const sourceName = sanitizeFileName(source.fileName || `招标文件${index + 1}`, `招标文件${index + 1}`);
+    const label = `招标文件-${padIndex(index)}-${sourceName}`;
+    const parts = splitTenderAgentSource(source.markdown, 10000);
+    if (parts.length <= 1) {
+      files.push({ path: `招标文件/${label}.md`, content: source.markdown });
+      continue;
+    }
+    const indexLines = [`# ${label}分片索引`, '', '先按标题定位相关分片，再按需读取；不要一次性读取全部原招标文件分片。'];
+    parts.forEach((part, partIndex) => {
+      const path = `招标文件/${label}/part-${String(partIndex + 1).padStart(3, '0')}.md`;
+      const heading = (part.match(/^\s*#{1,6}\s+.+$/m) || [])[0] || `第 ${partIndex + 1} 片`;
+      indexLines.push(`- ${path}：${heading.trim()}，约 ${part.length} 字`);
+      files.push({ path, content: part });
+    });
+    files.push({ path: `招标文件/${label}.md`, content: indexLines.join('\n') });
+  }
+  return files;
+}
+
 function formatProgressTitle(value) {
   const title = String(value || '').replace(/\s+/g, ' ').trim();
   return Array.from(title).slice(0, 20).join('');
@@ -159,10 +204,10 @@ function buildFileCatalog({ tenderPaths, isWorkingCopy, hasSectionHint, knowledg
   if (tenderPaths.length) {
     const listed = tenderPaths.join('、');
     if (isWorkingCopy) {
-      lines.push(`- ${listed}：排除其他标段后的当前投标范围正文，用于确定大项并提取明确事实；不要扩展到其他标段。`);
+      lines.push(`- ${listed}：原招标文件已按 1 万字左右分片存放，先读对应索引和相关分片；用于确定大项并提取明确事实，不要扩展到其他标段。`);
     } else {
       const multiNote = tenderPaths.length > 1 ? '；多份都要看' : '';
-      lines.push(`- ${listed}：招标原文，用于确定大项并提取明确事实${multiNote}。`);
+      lines.push(`- ${listed}：原招标文件已按 1 万字左右分片存放，先读索引和相关分片；用于确定大项并提取明确事实${multiNote}。`);
     }
   }
   lines.push('- 项目概述.md：项目背景和术语，用于确定大项，不作为商务/资格材料来源。');
@@ -346,19 +391,7 @@ async function runGlobalFactsTaskV2({
 
   publish('正在准备全局事实工作区材料。', 12);
 
-  const tenderFiles = tenderSources.map((source, index) => {
-    if (source.isWorkingCopy) {
-      return {
-        path: '招标文件/招标文件-当前投标范围.md',
-        content: source.markdown,
-      };
-    }
-    const fileName = sanitizeFileName(source.fileName, `招标文件${index + 1}`);
-    return {
-      path: `招标文件/招标文件-${padIndex(index)}-${fileName}.md`,
-      content: source.markdown,
-    };
-  });
+  const tenderFiles = buildTenderAgentFiles(tenderSources);
   const combinedTenderMarkdown = tenderSources.map((source) => String(source.markdown || '').trim()).filter(Boolean).join('\n\n');
   const tenderKnowledgeSnapshot = buildTenderKnowledgeSnapshot({
     tenderContextIndex: combinedTenderMarkdown ? createTenderContextIndex(combinedTenderMarkdown) : null,
