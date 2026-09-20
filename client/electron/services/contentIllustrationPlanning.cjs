@@ -45,6 +45,7 @@ function resolveSectionContent(item, sections) {
 // 从真实目录树构建 Agent 输入和程序校验索引。
 function buildIllustrationPlanningContext({ outlineData, sections, options, aiImagesAvailable = false }) {
   const sectionMap = new Map();
+  const itemById = new Map();
   const eligibleSectionIds = [];
   const markdownLines = ['# 技术方案正文', ''];
 
@@ -72,6 +73,7 @@ function buildIllustrationPlanningContext({ outlineData, sections, options, aiIm
         markdownLines.push('');
       }
 
+      itemById.set(id, item);
       sectionMap.set(id, {
         id,
         parentId,
@@ -103,7 +105,7 @@ function buildIllustrationPlanningContext({ outlineData, sections, options, aiIm
   for (const sectionId of eligibleSectionIds) {
     const context = sectionMap.get(sectionId);
     if (!context) continue;
-    const item = findOutlineItemById(outlineData?.outline || [], sectionId);
+    const item = itemById.get(sectionId);
     const content = resolveSectionContent(item || {}, sections);
     const bounded = content.length > candidateCharLimit
       ? `${content.slice(0, 1050)}\n…（仅规划预览，完整正文按需读取）…\n${content.slice(-250)}`
