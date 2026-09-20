@@ -5964,7 +5964,18 @@ workspace 文件说明：
       throw new Error('Agent 服务尚未初始化，无法执行 Agent 一致性修复');
     }
 
-    const allTargets = buildConsistencyAuditTargets('');
+    const rawAgentTargets = buildConsistencyAuditTargets('');
+    const normalizedTargetId = String(options.targetItemId || targetItemId || '').trim();
+    const requestedAgentAuditMode = String(
+      options.consistencyAuditMode
+      || options.consistency_audit_mode
+      || generationOptions.consistencyAuditMode
+      || generationOptions.consistency_audit_mode
+      || 'risk-based'
+    ).trim() || 'risk-based';
+    const allTargets = normalizedTargetId
+      ? rawAgentTargets
+      : selectConsistencyAuditTargets(rawAgentTargets, { mode: requestedAgentAuditMode });
     const sectionIndex = buildAgentConsistencySectionIndex(allTargets);
     if (!sectionIndex.size) {
       writeDeveloperLog('consistency.agent.skipped', { reason: 'no_targets', target_item_id: options.targetItemId || targetItemId || '' });
@@ -5973,7 +5984,6 @@ workspace 文件说明：
       return { ran: false, fixedCount: 0, failedCount: 0 };
     }
 
-    const normalizedTargetId = String(options.targetItemId || targetItemId || '').trim();
     const writableIds = normalizedTargetId ? new Set([normalizedTargetId]) : new Set(sectionIndex.keys());
     if (normalizedTargetId && !sectionIndex.has(normalizedTargetId)) {
       logs = [...logs, `Agent 一致性修复跳过：目标小节 ${normalizedTargetId} 当前没有成功正文。`];
@@ -5989,7 +5999,7 @@ workspace 文件说明：
     contentStats.audit_fix_failed = 0;
     contentStats.audit_agent_changed_sections = 0;
     contentStats.audit_agent_failed_sections = 0;
-    logs = [...logs, `开始 Agent 全文一致性修复：共 ${sectionIndex.size} 个正文小节${normalizedTargetId ? `，仅回写目标小节 ${normalizedTargetId}` : ''}。`];
+    logs = [...logs, `开始 Agent 一致性修复：原始 ${rawAgentTargets.length} 个成功小节，按 ${normalizedTargetId ? '单小节' : requestedAgentAuditMode} 筛选后实际处理 ${sectionIndex.size} 个小节${normalizedTargetId ? `，仅回写目标小节 ${normalizedTargetId}` : ''}。`];
     writeDeveloperLog('consistency.agent.start', {
       target_item_id: normalizedTargetId,
       section_count: sectionIndex.size,
