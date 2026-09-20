@@ -999,7 +999,7 @@ function createChatRequestBody(config, request, options = {}) {
 }
 
 // 保留 Pi 工具调用协议字段，并统一应用当前文本模型配置。
-function createAgentChatRequestBody(config, sourceBody) {
+function createAgentChatRequestBody(config, sourceBody, stage = '') {
   const source = sourceBody && typeof sourceBody === 'object' ? sourceBody : {};
   const messages = dedupeAdjacentTextMessages(Array.isArray(source.messages) ? source.messages : []);
   if (!messages.length) {
@@ -1024,7 +1024,7 @@ function createAgentChatRequestBody(config, sourceBody) {
     delete body.reasoning_effort;
   }
 
-  return applyOutputTokenLimit(body, config);
+  return applyOutputTokenLimit(body, config, stage);
 }
 
 async function fetchChatCompletion(app, config, body, options = {}) {
@@ -1562,7 +1562,7 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
   }
 
   const requestId = createRequestId();
-  const requestBody = createAgentChatRequestBody(config, request.body);
+  const requestBody = createAgentChatRequestBody(config, request.body, request.stage);
   ensureMultimodalEnabled(config, requestBody.messages);
   const requestMode = requestBody.stream ? 'stream' : 'normal';
   const logTitle = resolveAiLogTitle(request, 'Pi Agent');
