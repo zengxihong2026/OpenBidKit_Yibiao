@@ -29,6 +29,14 @@ function registerDeveloperIpc({ configStore, aiService, agentService, openDevelo
     broadcastTextTokenStats(stats);
   });
 
+  aiService.onTokenUsageLedgerChanged((ledger) => {
+    BrowserWindow.getAllWindows().forEach((window) => {
+      if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+        window.webContents.send('developer-token-ledger:changed', ledger);
+      }
+    });
+  });
+
   ipcMain.handle('developer-token-stats:open-window', () => {
     requireDeveloperMode(configStore);
     return openDeveloperTokenStatsWindow();
@@ -42,6 +50,16 @@ function registerDeveloperIpc({ configStore, aiService, agentService, openDevelo
   ipcMain.handle('developer-token-stats:reset', () => {
     requireDeveloperMode(configStore);
     return aiService.resetTextTokenStats();
+  });
+
+  ipcMain.handle('developer-token-ledger:get', (_event, options) => {
+    requireDeveloperMode(configStore);
+    return aiService.getTokenUsageLedger(options);
+  });
+
+  ipcMain.handle('developer-token-ledger:reset', () => {
+    requireDeveloperMode(configStore);
+    return aiService.resetTokenUsageLedger();
   });
 
   ipcMain.handle('developer-agent-monitor:open-window', () => {
