@@ -924,6 +924,21 @@ async function collectJsonResponseWithConfig(app, config, request) {
 }
 
 // 按文本模型设置统一输出上限，覆盖 Agent SDK 自带的长度参数。
+function dedupeAdjacentTextMessages(messages) {
+  const source = Array.isArray(messages) ? messages : [];
+  const result = [];
+  let previousKey = '';
+  for (const message of source) {
+    if (!message || typeof message !== 'object') continue;
+    const content = typeof message.content === 'string' ? message.content : '';
+    const key = content ? `${message.role || ''}:text:${content}` : '';
+    if (key && key === previousKey) continue;
+    result.push(message);
+    previousKey = key;
+  }
+  return result;
+}
+
 function applyOutputTokenLimit(body, config) {
   delete body.max_output_tokens;
   delete body.max_tokens;
@@ -942,7 +957,7 @@ function createChatRequestBody(config, request, options = {}) {
   const modelName = JINLONG_DEPRECATED_MODEL_MAP[config.model_name] || config.model_name;
   const body = {
     model: modelName,
-    messages: request.messages,
+    messages: dedupeAdjacentTextMessages(request.messages),
   };
 
   if (config.temperature_enabled) {
@@ -967,7 +982,7 @@ function createChatRequestBody(config, request, options = {}) {
 // 保留 Pi 工具调用协议字段，并统一应用当前文本模型配置。
 function createAgentChatRequestBody(config, sourceBody) {
   const source = sourceBody && typeof sourceBody === 'object' ? sourceBody : {};
-  const messages = Array.isArray(source.messages) ? source.messages : [];
+  const messages = dedupeAdjacentTextMessages(Array.isArray(source.messages) ? source.messages : []);
   if (!messages.length) {
     throw new Error('Agent 代理请求缺少 messages');
   }
