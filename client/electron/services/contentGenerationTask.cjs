@@ -3193,7 +3193,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     bidAnalysisTasks: storedPlan.bidAnalysisTasks,
     projectOverview,
   });
-  const tenderKnowledgeText = formatTenderKnowledgeForPrompt(tenderKnowledgeSnapshot, 6500);
+  const tenderKnowledgeText = formatTenderKnowledgeForPrompt(tenderKnowledgeSnapshot, 5000);
 
   function getTenderContextForItem(item) {
     if (!tenderMarkdown) return '';
