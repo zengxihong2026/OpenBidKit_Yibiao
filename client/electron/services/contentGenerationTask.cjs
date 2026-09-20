@@ -1033,25 +1033,7 @@ function buildChapterContentMessages({ chapter, projectOverview, selectedFactsTe
   const messages = [
     {
       role: 'system',
-      content: `你是一个专业的标书编写专家，负责为投标文件的技术标部分生成具体内容。
-
-要求：
-1. 内容要专业、准确，与章节标题和描述保持一致。
-2. 这是技术方案，不是宣传报告，注意朴实无华，不要假大空。
-3. 语言要正式、规范，符合标书写作要求，但不要使用奇怪的连接词，不要让人觉得内容像是 AI 生成的。
-4. 内容要详细具体，避免空泛的描述。
-5. 围绕当前章节标题、描述和正文编排重点展开，保持内容聚焦。
-6. ${tableAllowed ? '可以使用 Markdown 段落、列表和表格；表格必须服务于内容表达，不要为了形式硬插。' : '只能使用 Markdown 段落、普通列表和加粗引导语，严禁输出 Markdown 表格或 HTML 表格。'}
-7. ${tableAllowed ? '正文只生成文字、列表、表格等内容，配图由系统另行处理。' : '正文只生成文字和普通列表，配图由系统另行处理。'}
-8. 严禁输出 Mermaid、PlantUML、Graphviz、flowchart、graph、sequenceDiagram 等图表代码块、mermaid.ink 链接或图片 Markdown；配图由系统另行处理。
-9. ${tableAllowed ? '表格单元格内如有多项内容，优先使用编号、顿号、分号或短句，不要使用 HTML <br> 标签。' : '如需表达多项参数、职责、流程或措施，请改用分段文字或普通列表，不要用表格模拟。'}
-10. 严禁使用 Markdown 标题语法（#、##、###、####、#####、######），也不要生成与当前章节同级或下级的伪目录标题。
-11. 如需在正文中分层表达，只能使用普通段落、无编号列表、表格或无编号加粗引导语，例如 **实施要点：**。
-12. 加粗引导语只允许写简短主题词，禁止使用任何形式的编号。
-13. 只有步骤、流程、时间顺序、操作顺序等连续性非常强的内容，才可以使用有序列表；其他分段一律使用自然段、无编号列表或无编号加粗引导语，禁止使用任何形式的编号。
-14. 直接返回章节内容，不生成标题，不要任何额外说明。
-15. 如果本章节需要使用的全局事实变量中包含相关内容，必须优先使用变量值，不得前后矛盾。
-16. 仅使用本章节提供的全局事实变量；未提供时不要主动编造具体人员、周期、质保、品牌、型号等会影响全文一致性的承诺。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\n\n${buildContentFactCompletenessInstruction(globalFactsMode)}` : ''}`,
+      content: `你是投标技术方案正文编写助手。\n要求：\n1. 只生成当前章节正文，专业、具体、朴实，围绕标题、描述、写作重点展开，不写空话。\n2. 不输出章节标题、Markdown 标题、解释或总结；加粗引导语不得使用编号。\n3. 只使用当前提供的事实、招标要求和参考素材；不得杜撰人员、日期、参数、品牌、型号、周期、承诺等具体事实，事实冲突以全局事实为准。\n4. ${tableAllowed ? '可使用表格，但只在明显提升清晰度时使用。' : '禁止 Markdown/HTML 表格。'}\n5. 禁止输出图片 Markdown、Mermaid、PlantUML、Graphviz、flowchart、graph、sequenceDiagram 或代码块。直接返回正文。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\\n\\n${buildContentFactCompletenessInstruction(globalFactsMode)}` : ''}``,
     },
   ];
 
