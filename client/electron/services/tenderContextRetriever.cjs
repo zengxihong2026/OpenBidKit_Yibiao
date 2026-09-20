@@ -84,8 +84,22 @@ function scoreUnit(unit, keywords) {
   return score;
 }
 
-function retrieveTenderContext(markdown, query, options = {}) {
-  const units = splitTenderUnits(markdown);
+function createTenderContextIndex(markdown) {
+  const source = normalize(markdown);
+  return {
+    source_hash: source.length
+      ? require('node:crypto').createHash('sha256').update(source, 'utf8').digest('hex').slice(0, 16)
+      : '',
+    source_chars: source.length,
+    units: splitTenderUnits(source),
+  };
+}
+
+function retrieveTenderContext(markdownOrIndex, query, options = {}) {
+  const index = markdownOrIndex && typeof markdownOrIndex === 'object' && Array.isArray(markdownOrIndex.units)
+    ? markdownOrIndex
+    : createTenderContextIndex(markdownOrIndex);
+  const units = index.units || [];
   if (!units.length) return { query: normalize(query), snippets: [], total_chars: 0 };
   const maxSnippets = Math.max(1, Number(options.maxSnippets) || 4);
   const maxChars = Math.max(500, Number(options.maxChars) || 6000);
@@ -123,4 +137,10 @@ function formatTenderContextForPrompt(result) {
   }).join('\n\n');
 }
 
-module.exports = { extractKeywords, splitTenderUnits, retrieveTenderContext, formatTenderContextForPrompt };
+module.exports = {
+  extractKeywords,
+  splitTenderUnits,
+  createTenderContextIndex,
+  retrieveTenderContext,
+  formatTenderContextForPrompt,
+};
