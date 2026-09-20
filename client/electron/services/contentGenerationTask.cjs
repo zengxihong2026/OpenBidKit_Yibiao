@@ -1236,6 +1236,41 @@ function formatRestoreTargetsForPrompt(targets) {
   }).join('\n');
 }
 
+function normalizeRestoreTitleForMatch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}_-]+/gu, '')
+    .trim();
+}
+
+function autoMatchOriginalSegmentsByTitle(targets, originalSegments) {
+  const assignments = [];
+  const usedSourceIds = new Set();
+  const contexts = targets || [];
+  for (const segment of originalSegments || []) {
+    const titlePath = Array.isArray(segment?.title_path) ? segment.title_path.filter(Boolean) : [];
+    const leafTitle = normalizeRestoreTitleForMatch(titlePath[titlePath.length - 1] || '');
+    if (leafTitle.length < 4) continue;
+
+    const candidates = contexts.filter(({ item }) => {
+      const targetTitle = normalizeRestoreTitleForMatch(item?.title);
+      if (targetTitle.length < 4) return false;
+      return targetTitle === leafTitle
+        || targetTitle.includes(leafTitle)
+        || leafTitle.includes(targetTitle);
+    });
+    if (candidates.length !== 1 || usedSourceIds.has(segment.id)) continue;
+
+    assignments.push({
+      node_id: candidates[0].item.id,
+      source_ids: [segment.id],
+      reason: '标题高度确定匹配',
+    });
+    usedSourceIds.add(segment.id);
+  }
+  return assignments;
+}
+
 function buildOriginalMaterialRestoreMessages({ targets, originalSegments, projectOverview, bidAnalysisFactsText, globalFactTitlesText }) {
   return [
     {
@@ -4408,9 +4443,37 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     if (restoreTargets.length) {
       const allowedNodeIds = new Set(restoreTargets.map(({ item }) => item.id).filter(Boolean));
       const allowedSourceIds = new Set(originalPlanSegments.map((segment) => segment.id));
-      const restoreMessages = buildOriginalMaterialRestoreMessages({
+      const autoAssignments = autoMatchOriginalSegmentsByTitle(restoreTargets, originalPlanSegments);
+      const autoAssignedSourceIds = new Set(autoAssignments.flatMap((assignment) => assignment.source_ids));
+      const unresolvedOriginalSegments = originalPlanSegments.filter((segment) => !autoAssignedSourceIds.has(segment.id));
+      const targetById = new Map(restoreTargets.map((context) => [context.item.id, context]));
+
+      for (const assignment of autoAssignments) {
+        const context = targetById.get(assignment.node_id);
+        const segments = assignment.source_ids.map((sourceId) => originalPlanSegmentById.get(sourceId)).filter(Boolean);
+        if (!context || !segments.length) continue;
+        segments.forEach((segment) => assignedSourceIds.add(segment.id));
+        const restoredContent = segments.map((segment) => segment.content).join('\n\n').trim();
+        const plan = getContentPlanForItem(context.item.id);
+        const originalMaterial = buildOriginalMaterialFromSegments(segments);
+        completedRestoreTargetIds.add(context.item.id);
+        contentStats.restoration_completed = completedRestoreTargetIds.size;
+        saveSectionAndContentPlan(context.item, { status: 'idle', content: restoredContent, error: undefined }, restoredContent, {
+          ...plan,
+          original_material: originalMaterial,
+        }, { logs });
+        restoredCount += 1;
+      }
+      logs = [...logs, autoAssignments.length
+        ? `原方案还原：已有 ${autoAssignments.length} 个原文段通过标题高度确定匹配，跳过模型映射；剩余 ${unresolvedOriginalSegments.length} 个原文段交给模型。`
+        : '原方案还原：未发现足够确定的标题匹配，进入模型映射。'];
+
+      if (!unresolvedOriginalSegments.length) {
+        contentStats.restoration_total = Math.max(contentStats.restoration_total, completedRestoreTargetIds.size);
+      } else {
+        const restoreMessages = buildOriginalMaterialRestoreMessages({
         targets: restoreTargets,
-        originalSegments: originalPlanSegments,
+        originalSegments: unresolvedOriginalSegments,
         projectOverview,
         bidAnalysisFactsText,
         globalFactTitlesText,
@@ -4477,7 +4540,6 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         });
       }
 
-      const targetById = new Map(restoreTargets.map((context) => [context.item.id, context]));
       for (const assignment of result.assignments || []) {
         const context = targetById.get(assignment.node_id);
         if (!context) {
@@ -4498,6 +4560,8 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           original_material: originalMaterial,
         }, { logs });
         restoredCount += 1;
+      }
+        }
       }
     }
 
