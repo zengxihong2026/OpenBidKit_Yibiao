@@ -92,6 +92,7 @@ function createEmptySnapshot() {
     prompt_chars: 0,
     entries: [],
     by_stage: {},
+    by_context_hash: {},
   };
 }
 
@@ -185,6 +186,28 @@ function recordTokenUsageEvent(meta = {}, usage = null, outcome = {}) {
   if (entry.success) stageAggregate.success_count += 1;
   else stageAggregate.error_count += 1;
 
+  if (entry.context_hash) {
+    const contextAggregate = ledger.by_context_hash[entry.context_hash] || {
+      request_count: 0,
+      total_tokens: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_tokens: 0,
+      prompt_chars: 0,
+      stages: {},
+      last_seen: '',
+    };
+    contextAggregate.request_count += 1;
+    contextAggregate.total_tokens += entry.total_tokens;
+    contextAggregate.input_tokens += entry.input_tokens;
+    contextAggregate.output_tokens += entry.output_tokens;
+    contextAggregate.cached_tokens += entry.cached_tokens;
+    contextAggregate.prompt_chars += entry.prompt_chars;
+    contextAggregate.last_seen = entry.timestamp;
+    contextAggregate.stages[entry.stage] = (contextAggregate.stages[entry.stage] || 0) + 1;
+    ledger.by_context_hash[entry.context_hash] = contextAggregate;
+  }
+
   ledger.entries.push(entry);
   if (ledger.entries.length > MAX_LEDGER_ENTRIES) {
     ledger.entries.splice(0, ledger.entries.length - MAX_LEDGER_ENTRIES);
@@ -211,6 +234,19 @@ function getLedgerSnapshot(options = {}) {
     };
   }
 
+  const repeatedContexts = Object.entries(ledger.by_context_hash)
+    .filter(([, aggregate]) => aggregate.request_count > 1)
+    .sort((a, b) => (
+      b[1].total_tokens - a[1].total_tokens
+      || b[1].request_count - a[1].request_count
+    ))
+    .slice(0, 30)
+    .map(([contextHash, aggregate]) => ({
+      context_hash: contextHash,
+      ...aggregate,
+      cache_ratio: aggregate.input_tokens > 0 ? aggregate.cached_tokens / aggregate.input_tokens : 0,
+    }));
+
   return {
     request_count: ledger.request_count,
     success_count: ledger.success_count,
@@ -223,6 +259,7 @@ function getLedgerSnapshot(options = {}) {
     reasoning_tokens: ledger.reasoning_tokens,
     prompt_chars: ledger.prompt_chars,
     by_stage: byStage,
+    repeated_contexts: repeatedContexts,
     entries,
   };
 }
