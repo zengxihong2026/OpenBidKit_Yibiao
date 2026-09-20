@@ -1,5 +1,10 @@
 const { buildBidSectionContextHint } = require('../utils/bidSectionContext.cjs');
 const { GLOBAL_FACTS_AGENT_TASK_KEY } = require('./globalFactsAgentV2Config.cjs');
+const { createTenderContextIndex } = require('./tenderContextRetriever.cjs');
+const {
+  buildTenderKnowledgeSnapshot,
+  formatTenderKnowledgeForPrompt,
+} = require('./tenderKnowledge.cjs');
 const {
   formatBidAnalysisFactsForPrompt,
   formatOutlineForPrompt,
@@ -354,8 +359,18 @@ async function runGlobalFactsTaskV2({
       content: source.markdown,
     };
   });
+  const combinedTenderMarkdown = tenderSources.map((source) => String(source.markdown || '').trim()).filter(Boolean).join('\n\n');
+  const tenderKnowledgeSnapshot = buildTenderKnowledgeSnapshot({
+    tenderContextIndex: combinedTenderMarkdown ? createTenderContextIndex(combinedTenderMarkdown) : null,
+    tenderMarkdown: combinedTenderMarkdown,
+    bidAnalysisTasks: storedPlan.bidAnalysisTasks,
+    projectOverview: storedPlan.projectOverview || '',
+  });
+  const tenderKnowledgeText = formatTenderKnowledgeForPrompt(tenderKnowledgeSnapshot, 6500);
+
   const files = [
     ...tenderFiles,
+    { path: '招标知识快照.md', content: tenderKnowledgeText || '未生成结构化招标知识快照。' },
     { path: '项目概述.md', content: String(storedPlan.projectOverview || '').trim() || '未提供项目概述。' },
     { path: '招标解析结果.md', content: formatBidAnalysisFactsForPrompt(storedPlan) },
     { path: '技术方案目录.md', content: formatOutlineForPrompt(outlineData.outline || []) },
