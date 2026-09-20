@@ -533,6 +533,44 @@ function buildKnowledgeFiles(knowledgeBaseService, documentIds) {
   return files;
 }
 
+function splitAgentSourceMarkdown(markdown, maxChars = 9000) {
+  const source = String(markdown || '').trim();
+  if (!source) return [];
+  const lines = source.split(/\r?\n/);
+  const parts = [];
+  let buffer = [];
+  let chars = 0;
+  function flush() {
+    const text = buffer.join('\n').trim();
+    if (text) parts.push(text);
+    buffer = [];
+    chars = 0;
+  }
+  for (const line of lines) {
+    const lineChars = line.length + 1;
+    if (buffer.length && chars + lineChars > maxChars) flush();
+    buffer.push(line);
+    chars += lineChars;
+  }
+  flush();
+  return parts;
+}
+
+function buildAgentSourceFiles(label, markdown, options = {}) {
+  const maxChars = Math.max(3000, Number(options.maxChars) || 9000);
+  const parts = splitAgentSourceMarkdown(markdown, maxChars);
+  if (parts.length <= 1) return [{ path: label, content: String(markdown || '').trim() || '未提供。' }];
+  const files = [];
+  const indexLines = [`# ${label}分片索引`, '', '以下分片按原文顺序排列。先根据标题定位需要的分片，再按需读取，不要一次性读取全部分片。'];
+  parts.forEach((part, index) => {
+    const path = `${label.replace(/\.md$/i, '')}/part-${String(index + 1).padStart(3, '0')}.md`;
+    const firstHeading = (part.match(/^\s*#{1,6}\s+.+$/m) || [])[0] || `第 ${index + 1} 片`;
+    indexLines.push(`- ${path}：${firstHeading.trim()}，约 ${part.length} 字`);
+    files.push({ path, content: part });
+  });
+  return [{ path: label, content: indexLines.join('\n') }, ...files];
+}
+
 function createInitialPrompt(taskInstruction, { standaloneTechnical = false, noTechnicalScoreMode = false } = {}) {
   const goal = standaloneTechnical
     ? noTechnicalScoreMode
@@ -578,7 +616,7 @@ function createNoTechnicalScoreChildrenPrompt({ targetLeafCount, standaloneTechn
     : '只扩展 attr=技术 且 content_mode=ai-generate 的一级目录；其他一级目录保持原样，不得增加子目录。';
   return `用户已确认招标文件没有技术评分项，请直接根据确定的无技术评分项规则生成完整目录，不要判断是否存在评分项，也不要创建评分清单或评分映射。
 
-请阅读 ${OUTLINE_OUTPUT_FILE}、${originalOnly ? '原方案.md' : '响应文件要求.md、项目概述.md，以及存在的原方案.md 和参考知识库目录'}，然后覆盖写回 ${OUTLINE_OUTPUT_FILE}。
+请阅读 ${OUTLINE_OUTPUT_FILE}、${originalOnly ? '原方案.md（索引）及原方案/part-*.md' : '响应文件要求.md、项目概述.md，以及存在的原方案.md（索引）及原方案/part-*.md 和参考知识库目录'}，按需读取原方案分片，不要一次性读取全部原方案，然后覆盖写回 ${OUTLINE_OUTPUT_FILE}。
 
 要求：
 1. ${scopeInstruction}
@@ -595,7 +633,7 @@ function createLeafAllocationPrompt({ standaloneTechnical = false } = {}) {
   const allocationInstruction = standaloneTechnical
     ? '优先为每个目录分配至少 2 个；总目标不足时允许部分目录分配 1 个，表示保留一级目录本身作为叶子且不生成 children。除 1 以外不得分配少于 2 个，禁止形成只有一个子节点的冗余层级。'
     : '每个目录至少分配 2 个。';
-  return `请继续使用当前 Pi Session 已读取的技术评分信息、知识库、原方案和目录规划，为多个技术一级目录分配“AI生成”叶子数量。
+  return `请继续使用当前 Pi Session 已读取的技术评分信息、知识库、原方案索引/分片和目录规划，为多个技术一级目录分配“AI生成”叶子数量。
 
 要求：
 1. 阅读 ${OUTLINE_OUTPUT_FILE}、${TECHNICAL_SCORE_GROUPS_FILE}、${SCORE_DIRECTORY_PLAN_FILE} 和 ${LEAF_ALLOCATION_CONTEXT_FILE}。
@@ -622,7 +660,7 @@ function createScorePlanningPrompt({ standaloneTechnical = false } = {}) {
   return `用户已经确认最终保留的一级目录，${OUTLINE_OUTPUT_FILE} 已由程序重新整理并编号。工作区也已加入技术评分信息和用户选择的参考资料。
 
 请完成技术评分项结构化和目录规划：
-1. 阅读 ${OUTLINE_OUTPUT_FILE}、技术评分信息.md，以及存在的原方案.md 和参考知识库目录。
+1. 阅读 ${OUTLINE_OUTPUT_FILE}、技术评分信息.md，以及存在的原方案.md（索引）及原方案/part-*.md 和参考知识库目录；先定位后按需读取原方案分片。
 2. 程序已确认本任务存在技术评分项。只从技术评分信息.md 的“技术评分项”中提取适合在技术方案中一一响应、展开编写的评分大项。“技术评分要求”只能作为评分标准、扣分规则和编写约束，不得提取为评分项。
 3. 将评分大项写入 ${TECHNICAL_SCORE_GROUPS_FILE}，完整结构为 {"groups":[{"requirement_id":"R1","title":"评分大项","description":"关注内容","detail_points":["关键评分细项"]}]}。根对象只能包含 groups；保持原顺序、专业术语和关键评分细项，requirement_id 使用连续的 R1、R2 格式。
 ${placementInstruction}
@@ -798,13 +836,13 @@ async function runOutlineGenerationTaskV2({ aiService, agentService, ordinaryAge
   let initialFiles;
   let taskInstruction;
   if (originalOnly) {
-    initialFiles = [{ path: '原方案.md', content: originalPlan }];
+    initialFiles = buildAgentSourceFiles('原方案.md', originalPlan, { maxChars: 9000 });
     taskInstruction = noTechnicalScoreMode ? ORIGINAL_ONLY_DIRECTORY_RULE : '只根据原方案材料提取一级目录。';
   } else if (noTechnicalScoreMode) {
     initialFiles = [
-      { path: '响应文件要求.md', content: responseFileRequirements },
-      { path: '项目概述.md', content: storedPlan.projectOverview || '' },
-      ...(hasOriginalPlan ? [{ path: '原方案.md', content: originalPlan }] : []),
+      { path: '响应文件要求.md', content: compactPromptText(responseFileRequirements, 9000) },
+      { path: '项目概述.md', content: compactPromptText(storedPlan.projectOverview || '', 5000) },
+      ...(hasOriginalPlan ? buildAgentSourceFiles('原方案.md', originalPlan, { maxChars: 9000 }) : []),
       ...knowledgeFiles,
     ];
     taskInstruction = standaloneTechnical
@@ -812,10 +850,10 @@ async function runOutlineGenerationTaskV2({ aiService, agentService, ordinaryAge
       : '招标文件已确认没有技术评分项。优先按响应文件要求生成一级目录，并根据已有资料和专业经验补充必要的技术方案入口，不得判断或补造评分项。';
   } else {
     initialFiles = [
-      { path: '响应文件要求.md', content: responseFileRequirements },
-      ...(standaloneTechnical ? [{ path: '技术评分信息.md', content: storedPlan.techRequirements || '' }] : []),
-      { path: '项目概述.md', content: storedPlan.projectOverview || '' },
-      ...(hasOriginalPlan ? [{ path: '原方案.md', content: originalPlan }] : []),
+      { path: '响应文件要求.md', content: compactPromptText(responseFileRequirements, 9000) },
+      ...(standaloneTechnical ? [{ path: '技术评分信息.md', content: compactPromptText(storedPlan.techRequirements || '', 8000) }] : []),
+      { path: '项目概述.md', content: compactPromptText(storedPlan.projectOverview || '', 5000) },
+      ...(hasOriginalPlan ? buildAgentSourceFiles('原方案.md', originalPlan, { maxChars: 9000 }) : []),
     ];
     taskInstruction = standaloneTechnical
       ? '严格按照技术评分信息.md 中适合技术方案响应的评分大项组织一级目录，只生成技术方案独立分册。评分大项原文、顺序和数量是一级目录的权威依据；响应文件要求.md 只提供装订和响应约束，项目概述.md 仅用于理解背景和术语，原方案.md 仅用于参考下级标题表达。'
