@@ -924,17 +924,17 @@ async function collectJsonResponseWithConfig(app, config, request) {
 }
 
 // 按文本模型设置统一输出上限，覆盖 Agent SDK 自带的长度参数。
-function dedupeAdjacentTextMessages(messages) {
+function dedupeAdjacentTextMessages(messages) { // 去除请求中任意位置的完全重复文本消息，避免重复上下文；非文本/多模态消息原样保留
   const source = Array.isArray(messages) ? messages : [];
   const result = [];
-  let previousKey = '';
+  const seenTextMessages = new Set();
   for (const message of source) {
     if (!message || typeof message !== 'object') continue;
     const content = typeof message.content === 'string' ? message.content : '';
     const key = content ? `${message.role || ''}:text:${content}` : '';
-    if (key && key === previousKey) continue;
+    if (key && seenTextMessages.has(key)) continue;
     result.push(message);
-    previousKey = key;
+    if (key) seenTextMessages.add(key);
   }
   return result;
 }
