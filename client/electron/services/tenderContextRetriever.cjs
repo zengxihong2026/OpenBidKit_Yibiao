@@ -95,40 +95,81 @@ function createTenderContextIndex(markdown) {
   };
 }
 
+function buildEvidenceWindow(text, keywords, maxChars) {
+  const source = String(text || '').trim();
+  const limit = Math.max(500, Number(maxChars) || 6000);
+  if (!source || source.length <= limit) return source;
+
+  const normalized = source.toLowerCase();
+  const positions = [];
+  for (const keyword of keywords || []) {
+    if (!keyword) continue;
+    const index = normalized.indexOf(String(keyword).toLowerCase());
+    if (index >= 0) positions.push({ index, keyword });
+  }
+  const center = positions.length
+    ? positions.sort((a, b) => a.index - b.index)[0].index
+    : Math.floor(source.length / 2);
+
+  const radius = Math.max(200, Math.floor(limit * 0.42));
+  let start = Math.max(0, center - radius);
+  let end = Math.min(source.length, start + limit);
+  if (end - start < limit) {
+    start = Math.max(0, end - limit);
+  }
+
+  const prefix = start > 0 ? '…（前文省略）…\n' : '';
+  const suffix = end < source.length ? '\n…（后文省略）…' : '';
+  return prefix + source.slice(start, end).trim() + suffix;
+}
+
 function retrieveTenderContext(markdownOrIndex, query, options = {}) {
   const index = markdownOrIndex && typeof markdownOrIndex === 'object' && Array.isArray(markdownOrIndex.units)
     ? markdownOrIndex
     : createTenderContextIndex(markdownOrIndex);
   const units = index.units || [];
-  if (!units.length) return { query: normalize(query), snippets: [], total_chars: 0 };
+  if (!units.length) return { query: normalize(query), snippets: [], total_chars: 0, matched: false };
+
   const maxSnippets = Math.max(1, Number(options.maxSnippets) || 4);
   const maxChars = Math.max(500, Number(options.maxChars) || 6000);
+  const perSnippetChars = Math.max(500, Math.min(
+    Number(options.perSnippetChars) || Math.floor(maxChars / Math.max(1, maxSnippets)),
+    maxChars,
+  ));
   const keywords = extractKeywords(query);
-  const ranked = units.map((unit, index) => ({ unit, index, score: scoreUnit(unit, keywords) })).sort((a, b) => b.score - a.score || a.index - b.index);
+  const ranked = units
+    .map((unit, index) => ({ unit, index, score: scoreUnit(unit, keywords) }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
   const selected = [];
   let totalChars = 0;
   const seen = new Set();
   for (const entry of ranked) {
-    if (entry.score <= 0 && selected.length) break;
     const key = entry.unit.text.slice(0, 120);
     if (seen.has(key)) continue;
-    if (totalChars + entry.unit.text.length > maxChars && selected.length) continue;
+    const snippetBudget = Math.min(perSnippetChars, maxChars - totalChars);
+    if (snippetBudget < 500 && selected.length) break;
+    const text = buildEvidenceWindow(entry.unit.text, keywords, snippetBudget);
+    if (!text) continue;
     seen.add(key);
-    selected.push({ score: entry.score, heading_path: entry.unit.headingPath, text: entry.unit.text });
-    totalChars += entry.unit.text.length;
+    selected.push({
+      score: entry.score,
+      heading_path: entry.unit.headingPath,
+      text,
+      source_char_count: entry.unit.text.length,
+    });
+    totalChars += text.length;
     if (selected.length >= maxSnippets || totalChars >= maxChars) break;
   }
-  if (!selected.length) {
-    const fallback = units[0];
-    if (fallback) {
-      const fallbackText = fallback.text.length > Math.min(2000, maxChars)
-        ? fallback.text.slice(0, Math.min(2000, maxChars))
-        : fallback.text;
-      selected.push({ score: 0, heading_path: fallback.headingPath, text: fallbackText });
-      totalChars += fallbackText.length;
-    }
-  }
-  return { query: normalize(query), keywords, snippets: selected, total_chars: totalChars };
+
+  return {
+    query: normalize(query),
+    keywords,
+    snippets: selected,
+    total_chars: totalChars,
+    matched: selected.length > 0,
+  };
 }
 
 function formatTenderContextForPrompt(result) {
