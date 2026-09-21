@@ -209,7 +209,7 @@ function compactKnowledgeItemContent(content, maxChars = 4500) {
 function formatKnowledgeItemFile(item) {
   const title = String(item?.title || '知识库条目').trim();
   const resume = String(item?.resume || '').trim() || '无';
-  const content = compactKnowledgeItemContent(item?.content, 4500);
+  const content = compactKnowledgeItemContent(item?.content, 3000);
   return `# ${title}\n\n简介：${resume}\n\n${content}`.trim();
 }
 
@@ -413,7 +413,7 @@ async function runGlobalFactsTaskV2({
     bidAnalysisTasks: storedPlan.bidAnalysisTasks,
     projectOverview: storedPlan.projectOverview || '',
   });
-  const tenderKnowledgeText = formatTenderKnowledgeForPrompt(tenderKnowledgeSnapshot, 6500);
+  const tenderKnowledgeText = formatTenderKnowledgeForPrompt(tenderKnowledgeSnapshot, 4500);
 
   const files = [
     ...tenderFiles,
@@ -426,7 +426,7 @@ async function runGlobalFactsTaskV2({
     files.push({ path: '标段说明.md', content: sectionHint });
   }
   let knowledgeChars = 0;
-  const knowledgeTotalLimit = 16000;
+  const knowledgeTotalLimit = 10000;
   knowledgeItems.forEach((item, index) => {
     if (knowledgeChars >= knowledgeTotalLimit) return;
     const content = formatKnowledgeItemFile(item);
