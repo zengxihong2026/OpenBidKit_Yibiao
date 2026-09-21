@@ -27,6 +27,7 @@ const {
 const {
   buildTenderKnowledgeSnapshot,
   formatTenderKnowledgeForPrompt,
+  selectTenderKnowledgeForQuery,
 } = require('./tenderKnowledge.cjs');
 
 const DEFAULT_CONTEXT_LENGTH_LIMIT = 400000;
@@ -4121,7 +4122,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     return result;
   }
 
-  function buildChapterContentPlanBatchMessages(contexts) {
+  function buildChapterContentPlanBatchMessages(contexts, tenderKnowledgeTextOverride) {
     const rows = contexts.map(({ item, parentChapters, siblingChapters }) => {
       const siblingText = (siblingChapters || [])
         .filter((sibling) => sibling.id !== item.id)
@@ -4162,7 +4163,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           { maxItems: 30, maxChars: 7000 },
         ),
       )}` },
-      { role: 'user', content: `结构化招标知识快照：\n${tenderKnowledgeText || '未提供'}` },
+      { role: 'user', content: `结构化招标知识快照（已按本批次小节相关性裁剪）：\n${tenderKnowledgeTextOverride || '未提供'}` },
       { role: 'user', content: `Step04 全局事实变量标题清单：\n${globalFactTitlesText || '未提供'}` },
       { role: 'user', content: `当前批次小节：\n${rows}` },
       { role: 'user', content: `请严格返回：
@@ -4214,7 +4215,14 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     if (!contexts.length) return;
     const batchId = `content-plan-${Date.now()}-${contexts[0].item.id}`;
     const results = await aiService.collectJsonResponse({
-      messages: buildChapterContentPlanBatchMessages(contexts),
+      messages: buildChapterContentPlanBatchMessages(
+        contexts,
+        selectTenderKnowledgeForQuery(
+          tenderKnowledgeSnapshot,
+          contexts.map(({ item }) => `${item.title || ''} ${item.description || ''}`).join('\n'),
+          2800,
+        ),
+      ),
       logTitle: `正文批量编排-${contexts[0].item.id}-${contexts[contexts.length - 1].item.id}`,
       progressLabel: '正文批量编排',
       stage: 'content-planning',
@@ -4257,7 +4265,11 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           projectOverview,
           bidAnalysisFactsText,
           globalFactTitlesText,
-          tenderKnowledgeText,
+          tenderKnowledgeText: selectTenderKnowledgeForQuery(
+            tenderKnowledgeSnapshot,
+            `${item.title || ''} ${item.description || ''}`,
+            2800,
+          ),
           regenerateRequirement,
           tableRequirement,
           maxTables,
