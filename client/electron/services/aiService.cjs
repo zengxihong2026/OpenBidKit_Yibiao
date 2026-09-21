@@ -951,6 +951,7 @@ const DEFAULT_STAGE_OUTPUT_TOKEN_LIMITS = Object.freeze({
   'json-repair': 5000,
   'word-adjustment': 6000,
   'table-cleanup': 6000,
+  illustration: 12000,
 });
 
 function resolveStageOutputTokenLimit(config, stage) {
