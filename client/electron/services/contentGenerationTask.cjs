@@ -49,6 +49,7 @@ const TOTAL_WORD_SHRINK_MIN_CAPACITY_RATIO = 0.3;
 const CONTENT_WORD_CONTROL_WARNING = '经多轮修复，字数仍未达预期，请您人工核对';
 const SECTION_WORD_CONTROL_WARNING = '字数未达预期，请您人工核对';
 const CONSISTENCY_AUDIT_GROUP_WORD_LIMIT = 300000;
+const CONSISTENCY_AUDIT_GROUP_CHAR_LIMIT = 140000;
 const CONSISTENCY_REPAIR_MAX_ATTEMPTS = 2;
 const ORIGINAL_PLAN_SEGMENT_MAX_CHARS = 6000;
 const ORIGINAL_COVERAGE_REPAIR_MAX_ATTEMPTS = 2;
@@ -6123,33 +6124,37 @@ workspace 文件说明：
   }
 
   function buildConsistencyAuditGroups(targets) {
-    const totalWords = (targets || []).reduce((sum, item) => sum + item.words, 0);
-    if (!targets?.length) {
-      return [];
-    }
-
-    let groupCount = 1;
-    if (totalWords > CONSISTENCY_AUDIT_GROUP_WORD_LIMIT) {
-      groupCount = 2;
-      while (totalWords / groupCount > CONSISTENCY_AUDIT_GROUP_WORD_LIMIT) {
-        groupCount += 1;
-      }
-    }
+    if (!targets?.length) return [];
+    const totalWords = targets.reduce((sum, item) => sum + item.words, 0);
+    const totalChars = targets.reduce((sum, item) => sum + Math.min(String(item.content || '').length, 3500), 0);
+    const wordGroups = Math.max(1, Math.ceil(totalWords / CONSISTENCY_AUDIT_GROUP_WORD_LIMIT));
+    const charGroups = Math.max(1, Math.ceil(totalChars / CONSISTENCY_AUDIT_GROUP_CHAR_LIMIT));
+    const groupCount = Math.max(1, wordGroups, charGroups);
     const targetWords = Math.max(1, Math.ceil(totalWords / groupCount));
+    const targetChars = Math.max(1, Math.ceil(totalChars / groupCount));
     const groups = [];
-    let current = { index: 1, items: [], words: 0, targetWords };
+    let current = { index: 1, items: [], words: 0, estimated_chars: 0, targetWords, targetChars };
 
     for (const target of targets) {
-      if (current.items.length && current.words + target.words > targetWords && groups.length < groupCount - 1) {
+      const estimatedChars = Math.min(String(target.content || '').length, 3500);
+      const wouldExceedWords = current.items.length && current.words + target.words > targetWords;
+      const wouldExceedChars = current.items.length && current.estimated_chars + estimatedChars > targetChars;
+      if ((wouldExceedWords || wouldExceedChars) && groups.length < groupCount - 1) {
         groups.push(current);
-        current = { index: groups.length + 1, items: [], words: 0, targetWords };
+        current = {
+          index: groups.length + 1,
+          items: [],
+          words: 0,
+          estimated_chars: 0,
+          targetWords,
+          targetChars,
+        };
       }
       current.items.push(target);
       current.words += target.words;
+      current.estimated_chars += estimatedChars;
     }
-    if (current.items.length) {
-      groups.push(current);
-    }
+    if (current.items.length) groups.push(current);
     return groups.map((group, index) => ({ ...group, index: index + 1, total: groups.length, totalWords }));
   }
 
