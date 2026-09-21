@@ -589,22 +589,25 @@ async function runKeyBidAnalysisBundle({ aiService, fileContent, sectionHint, te
   });
 }
 
-// Markdown 整项无结果时完整重跑一次，第二次结果原样交给上层保存。
+// Markdown 整项无结果时直接结束；局部检索没有命中时禁止把同一任务完整重跑一次，避免无效 Token 消耗。
 async function runBidAnalysisPromptTask(options) {
   const content = await runBidAnalysisPromptTaskOnce(options);
   if (!isMissingMarkdownResult(options.task, content)) return content;
+
   const taskId = options.task?.id || '';
   const retrievalHint = TASK_RETRIEVAL_HINTS[taskId] || '';
   if (retrievalHint && options.tenderContextIndex) {
     const probe = retrieveTenderContext(options.tenderContextIndex, retrievalHint, {
       maxSnippets: 1,
       maxChars: 1200,
+      perSnippetChars: 1200,
     });
-    if (!(probe?.snippets || []).length) {
+    if (probe?.matched) {
+      // 当前 Retriever 已经把第一次请求限定为同一局部证据窗口；若仍无结果，继续请求只会重复发送相同证据。
       return content;
     }
   }
-  return runBidAnalysisPromptTaskOnce(options);
+  return content;
 }
 
 function runInvalidBidAndRejectionItemsExtraction({ aiService, fileContent, sectionHint }) {
