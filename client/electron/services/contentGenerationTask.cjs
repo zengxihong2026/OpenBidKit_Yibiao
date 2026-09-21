@@ -1199,6 +1199,15 @@ function formatOriginalSegmentsForPrompt(segments) {
 ${segment.content}
 </original_segment>`).join('\n\n');
 }
+function formatOriginalSegmentsForMappingPrompt(segments, maxContentChars = 1200) {
+  return (segments || []).map((segment) => `<original_segment id="${segment.id}">
+标题路径：${segment.title_path?.length ? segment.title_path.join(' > ') : '未识别标题'}
+字符数：${segment.chars || String(segment.content || '').length}
+原文预览（仅用于归属判断，完整原文保存在 Agent 工作区中）：
+${compactPromptText(segment.content, maxContentChars)}
+</original_segment>`).join('\n\n');
+}
+
 
 function formatRestoreTargetsForPrompt(targets) {
   return (targets || []).map(({ item, parentChapters, siblingChapters }) => {
@@ -1272,10 +1281,10 @@ function buildOriginalMaterialRestoreMessages({ targets, originalSegments, proje
   ]
 }`,
     },
-    { role: 'user', content: `招标文件关键信息：\n${formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText)}` },
+    { role: 'user', content: `招标文件关键信息（已压缩）：\n${compactPromptText(formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText), 3500)}` },
     { role: 'user', content: `Step04 全局事实变量标题清单：\n${globalFactTitlesText || '未提供'}` },
     { role: 'user', content: `当前可还原叶子节点：\n${formatRestoreTargetsForPrompt(targets) || '无'}` },
-    { role: 'user', content: `原方案段落：\n${formatOriginalSegmentsForPrompt(originalSegments)}` },
+    { role: 'user', content: `原方案段落预览：\n${formatOriginalSegmentsForMappingPrompt(originalSegments)}` },
     { role: 'user', content: '请只返回 JSON，不要生成正文。' },
   ];
 }
@@ -1483,7 +1492,7 @@ function buildOriginalRestoreRepairMessages({ invalidContent, issues }, targets,
 6. 严禁输出正文、总结、解释或 Markdown。`,
     },
     { role: 'user', content: `当前可还原叶子节点：\n${formatRestoreTargetsForPrompt(targets) || '无'}` },
-    { role: 'user', content: `原方案段落（用于判断 source_ids 是否只有标题、编号或实质正文）：\n${formatOriginalSegmentsForPrompt(originalSegments) || '无'}` },
+    { role: 'user', content: `原方案段落预览（用于判断 source_ids 是否只有标题、编号或实质正文）：\n${formatOriginalSegmentsForMappingPrompt(originalSegments) || '无'}` },
     { role: 'user', content: `错误列表：\n${issueLines}` },
     { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
