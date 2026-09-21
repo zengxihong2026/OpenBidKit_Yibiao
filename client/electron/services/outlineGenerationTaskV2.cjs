@@ -1010,13 +1010,38 @@ async function runOutlineGenerationTaskV2({ aiService, agentService, ordinaryAge
     };
   }
 
+  function isDeterministicallyCleanOutlineReview(reviewContext) {
+    const leaf = reviewContext?.leaf_count || {};
+    const structure = reviewContext?.structure || {};
+    const mapping = reviewContext?.score_mapping;
+    const leafValid = leaf.within_acceptable_range !== false;
+    const structureValid = structure.valid === true;
+    const mappingValid = !mapping || mapping.valid === true;
+    return leafValid && structureValid && mappingValid;
+  }
+
   function continueWithOutlineReview() {
     const reviewContext = buildOutlineReviewContext({
       outline: finalOutline,
       scoreDirectoryPlan,
       targetLeafCount,
     });
-    publish('子目录生成完成，正在准备最终审核', 88, {
+    if (isDeterministicallyCleanOutlineReview(reviewContext)) {
+      publish('目录确定性检查通过，跳过额外 Agent 终审', 95, {
+        outline: {
+          phase: 'done',
+          current_leaf_count: actualLeafCount,
+          target_leaf_count: targetLeafCount,
+          word_adjustment_attempts: wordAdjustmentAttempts,
+        },
+      });
+      return {
+        complete: true,
+        output_content: JSON.stringify(finalOutline, null, 2),
+      };
+    }
+
+    publish('子目录生成完成，存在需语义审核的问题，进入最终审核', 88, {
       outline: {
         phase: 'reviewing',
         current_leaf_count: actualLeafCount,
