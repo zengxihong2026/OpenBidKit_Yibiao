@@ -53,7 +53,7 @@ const CONSISTENCY_REPAIR_MAX_ATTEMPTS = 2;
 const ORIGINAL_PLAN_SEGMENT_MAX_CHARS = 6000;
 const ORIGINAL_COVERAGE_REPAIR_MAX_ATTEMPTS = 2;
 const TABLE_CLEANUP_CONTEXT_CHARS = 600;
-const TABLE_CLEANUP_BATCH_CHAR_LIMIT = 30000;
+const TABLE_CLEANUP_BATCH_CHAR_LIMIT = 20000;
 const CONTENT_GENERATION_PAUSED = 'CONTENT_GENERATION_PAUSED';
 const CONTENT_PLAN_VERSION = 5;
 // Token 优化：单个正文小节默认最多注入 3 条知识库正文素材；如需更多内容应通过后续局部补充，而不是把整库上下文带入每次生成。
@@ -2141,7 +2141,7 @@ function buildOriginalCoverageAuditMessages({ target }) {
     { role: 'user', content: `当前小节：${target.item.id || 'unknown'} ${target.item.title || '未命名章节'}\n路径：${formatChapterPath(target)}\n描述：${target.item.description || ''}` },
     { role: 'user', content: `允许的 source_id：\n${JSON.stringify(allowedSourceIds, null, 2)}` },
     { role: 'user', content: `原方案来源段：\n${formatOriginalCoverageSources(target.sources)}` },
-    { role: 'user', content: `当前小节正文：\n${target.content || ''}` },
+    { role: 'user', content: `当前小节正文候选内容（优先保留与来源事实相关的段落；未展示段落不作为本轮审计证据）：\n${selectEditableParagraphs(target.content, `${target.item?.title || ''} ${target.item?.description || ''} ${formatOriginalCoverageSources(target.sources)}`, 'shrink', 14000) || String(target.content || '').slice(0, 14000)}` },
     { role: 'user', content: '请只返回覆盖审计 JSON。' },
   ];
 }
@@ -6062,12 +6062,14 @@ ${String(section.originalContent || '').trim()}
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd();
   }
 
-  function buildAgentGlobalFactsMarkdown() {
+  function buildAgentGlobalFactsMarkdown(targets = []) {
+    const query = (targets || []).map((target) => `${target?.item?.title || ''} ${target?.item?.description || ''} ${String(target?.content || '').slice(0, 1200)}`).join('\n');
+    const relevantFacts = selectRelevantConsistencyFacts(globalFactsText, query, Math.min(CONSISTENCY_FACT_CONTEXT_MAX_CHARS, 4500));
     return [
-      '# 全局事实变量',
-      globalFactsText || '未提供',
-      '# Step02 关键解析结果',
-      bidAnalysisFactsText || '未提供',
+      '# 与本轮审计相关的全局事实变量',
+      relevantFacts || '未提供',
+      '# 与本轮审计相关的 Step02 关键解析结果',
+      compactPromptText(bidAnalysisFactsText, 2500),
     ].join('\n\n');
   }
 
@@ -6207,7 +6209,7 @@ workspace 文件说明：
 
     updateAgentConsistencyProgress(1, '准备 Agent 输入文件');
     const files = [
-      { path: 'global-facts.md', content: buildAgentGlobalFactsMarkdown() },
+      { path: 'global-facts.md', content: buildAgentGlobalFactsMarkdown(allTargets) },
       ...buildAgentTechnicalPlanFiles(sectionIndex),
     ];
     pauseIfRequested('正文生成已在 Agent 全文一致性修复开始前暂停，本次 Agent 未启动；继续后将重新执行 Agent 修复。');
