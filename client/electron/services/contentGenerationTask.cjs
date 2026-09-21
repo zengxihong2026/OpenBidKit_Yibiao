@@ -3679,7 +3679,10 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     }
 
     try {
-      const result = await agentService.runTask(payload);
+      const result = await agentService.runTask({
+        ...payload,
+        initial_stage: payload.initial_stage || eventPrefix,
+      });
       if (isAgentBusyResult(result)) {
         writeDeveloperLog(`${eventPrefix}.agent.busy`, {
           message: result?.message || 'Agent 正在处理其他任务',
