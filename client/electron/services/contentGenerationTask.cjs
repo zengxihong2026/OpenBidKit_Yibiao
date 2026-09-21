@@ -2025,7 +2025,7 @@ function buildConsistencyRepairMessages({ context, conflicts, globalFactsText, b
     { role: 'user', content: `Step02 关键解析结果（已按一致性修复上下文预算压缩）：\n${boundedBidAnalysisFactsText || '未提供'}` },
     { role: 'user', content: `当前小节：${item.id || 'unknown'} ${item.title || '未命名章节'}\n路径：${formatChapterPath(context)}\n描述：${item.description || ''}` },
     { role: 'user', content: `审计发现的冲突：\n${JSON.stringify(conflicts || [], null, 2)}` },
-    { role: 'user', content: `当前小节正文（带行号；patch 的 old_text/new_text 不要包含这些行号）：\n${formatContentWithLineNumbers(currentContent)}` },
+    { role: 'user', content: `当前小节正文候选行窗口（行号沿用原文；patch 的 old_text/new_text 不要包含行号；未展示正文行不作为本轮修改目标）：\n${buildEditableLineWindows(currentContent, `${repairQuery} ${JSON.stringify(conflicts || [])}`, 18000)}` },
     { role: 'user', content: `patches[*].section_id 必须是 ${item.id || 'unknown'}。修复尝试次数：${attempt}/${CONSISTENCY_REPAIR_MAX_ATTEMPTS}${failureBlock}\n请只返回 JSON。` },
   ];
 }
@@ -2261,7 +2261,7 @@ function buildOriginalCoverageRepairMessages({ target, coverageItems, currentCon
     { role: 'user', content: `当前小节：${target.item.id || 'unknown'} ${target.item.title || '未命名章节'}\n路径：${formatChapterPath(target)}\n描述：${target.item.description || ''}` },
     { role: 'user', content: `需要补回的原方案来源段：\n${formatOriginalCoverageSources(issueSources)}` },
     { role: 'user', content: `覆盖审计问题：\n${JSON.stringify(coverageItems || [], null, 2)}` },
-    { role: 'user', content: `当前小节正文：\n${currentContent || ''}` },
+    { role: 'user', content: `当前小节正文候选段落（仅在此范围内选择 insert anchor / replace target_text）：\n${selectEditableParagraphs(currentContent, `${target.item?.title || ''} ${target.item?.description || ''} ${JSON.stringify(coverageItems || [])}`, 'expand', 16000) || String(currentContent || '').slice(0, 16000)}` },
     { role: 'user', content: `补写尝试次数：${attempt}/${ORIGINAL_COVERAGE_REPAIR_MAX_ATTEMPTS}${failureBlock}\n请只返回 JSON。` },
   ];
 }
@@ -2577,6 +2577,120 @@ function validateWordAdjustmentResponse(value) {
   }
 }
 
+function selectEditableParagraphs(content, query, mode, maxChars = 16000) {
+  const paragraphs = normalizeParagraphs(content);
+  if (!paragraphs.length) return '';
+  const keywords = extractLocalPromptKeywords(query);
+  const riskPattern = /(参数|型号|设备|人员|项目经理|技术负责人|工期|周期|验收|质保|售后|安全|应急|合同|付款|标准|规范|响应|培训|承诺|数量|规格|金额|日期|地点)/;
+  const scored = paragraphs.map((paragraph, index) => {
+    const lower = paragraph.toLowerCase();
+    const keywordScore = keywords.reduce((sum, keyword) => {
+      const hits = lower.split(keyword).length - 1;
+      return sum + Math.min(8, hits * 2);
+    }, 0);
+    const riskScore = riskPattern.test(paragraph) ? 6 : 0;
+    const lengthScore = mode === 'shrink'
+      ? Math.min(20, Math.floor(paragraph.length / 350))
+      : Math.max(0, 12 - Math.floor(paragraph.length / 500));
+    return { paragraph, index, score: keywordScore + riskScore + lengthScore };
+  }).sort((a, b) => b.score - a.score || a.index - b.index);
+
+  const selectedIndexes = new Set();
+  const add = (index) => {
+    if (index < 0 || index >= paragraphs.length) return;
+    selectedIndexes.add(index);
+    if (selectedIndexes.size < 8) {
+      selectedIndexes.add(Math.max(0, index - 1));
+      selectedIndexes.add(Math.min(paragraphs.length - 1, index + 1));
+    }
+  };
+  add(0);
+  add(paragraphs.length - 1);
+
+  let chars = 0;
+  for (const entry of scored) {
+    if (chars >= maxChars) break;
+    add(entry.index);
+    const preview = [...selectedIndexes].sort((a, b) => a - b).map((index) => paragraphs[index]).join('\n\n');
+    if (preview.length > maxChars) {
+      selectedIndexes.delete(entry.index);
+      selectedIndexes.delete(Math.max(0, entry.index - 1));
+      selectedIndexes.delete(Math.min(paragraphs.length - 1, entry.index + 1));
+      continue;
+    }
+    chars = preview.length;
+  }
+
+  return [...selectedIndexes]
+    .sort((a, b) => a - b)
+    .map((index) => paragraphs[index])
+    .join('\n\n');
+}
+
+function buildEditableLineWindows(content, query, maxChars = 18000) {
+  const text = normalizeNewlines(content);
+  if (!text || text.length <= maxChars) return formatContentWithLineNumbers(text);
+  const lines = text.split('\n');
+  const keywords = extractLocalPromptKeywords(query);
+  const riskPattern = /(参数|型号|设备|人员|项目经理|技术负责人|工期|周期|验收|质保|售后|安全|应急|合同|付款|标准|规范|响应|培训|承诺|数量|规格|金额|日期|地点|资质|证书|业绩)/;
+  const scored = lines.map((line, index) => {
+    const lower = line.toLowerCase();
+    const keywordScore = keywords.reduce((sum, keyword) => sum + Math.min(6, (lower.split(keyword).length - 1) * 2), 0);
+    const riskScore = riskPattern.test(line) ? 8 : 0;
+    const edgeScore = index < 3 || index >= lines.length - 3 ? 3 : 0;
+    return { index, score: keywordScore + riskScore + edgeScore };
+  }).sort((a, b) => b.score - a.score || a.index - b.index);
+
+  const selected = new Set([0, 1, Math.max(0, lines.length - 2), Math.max(0, lines.length - 1)]);
+  for (const entry of scored) {
+    if (selected.size >= Math.min(lines.length, 80)) break;
+    for (let offset = -2; offset <= 2; offset += 1) {
+      const index = entry.index + offset;
+      if (index >= 0 && index < lines.length) selected.add(index);
+    }
+    const blocks = [];
+    const sorted = [...selected].sort((a, b) => a - b);
+    let start = sorted[0];
+    let previous = sorted[0];
+    for (let i = 1; i < sorted.length; i += 1) {
+      const current = sorted[i];
+      if (current !== previous + 1) {
+        blocks.push([start, previous]);
+        start = current;
+      }
+      previous = current;
+    }
+    blocks.push([start, previous]);
+    const candidate = blocks.map(([from, to]) => lines.slice(from, to + 1).map((line, offset) => {
+      const number = String(from + offset + 1).padStart(Math.max(3, String(lines.length).length), '0');
+      return `[${number}] ${line}`;
+    }).join('\n')).join('\n…（未展示无关正文行）…\n');
+    if (candidate.length > maxChars) {
+      selected.delete(entry.index);
+      for (let offset = -2; offset <= 2; offset += 1) selected.delete(entry.index + offset);
+      continue;
+    }
+  }
+
+  const sorted = [...selected].sort((a, b) => a - b);
+  const blocks = [];
+  let start = sorted[0];
+  let previous = sorted[0];
+  for (let i = 1; i < sorted.length; i += 1) {
+    const current = sorted[i];
+    if (current !== previous + 1) {
+      blocks.push([start, previous]);
+      start = current;
+    }
+    previous = current;
+  }
+  blocks.push([start, previous]);
+  return blocks.map(([from, to]) => lines.slice(from, to + 1).map((line, offset) => {
+    const number = String(from + offset + 1).padStart(Math.max(3, String(lines.length).length), '0');
+    return `[${number}] ${line}`;
+  }).join('\n')).join('\n…（未展示无关正文行）…\n');
+}
+
 function buildWordAdjustmentRepairMessages({ invalidContent, issues }, expectedMode, expectedGranularity, currentContent) {
   const operationRule = expectedMode === 'expand'
     ? '扩写只允许 insert/replace。insert 的 anchor 必须逐字复制当前正文中的唯一完整原文块，或使用 start/end；replace 的 target_text 必须逐字复制当前正文中的唯一完整目标。'
@@ -2587,7 +2701,7 @@ function buildWordAdjustmentRepairMessages({ invalidContent, issues }, expectedM
   return [
     { role: 'user', content: `请把待修复内容整理为正文局部字数调整 JSON。mode 必须是 ${expectedMode}，granularity 必须是 ${expectedGranularity}，operations 至少一项。${operationRule} content 不得包含标题、图片、Mermaid、代码块或表格，不得破坏列表层级、事实参数和服务承诺。返回格式：${responseFormat}。只返回 JSON。` },
     { role: 'user', content: `错误列表：\n${(issues || []).map((item, index) => `${index + 1}. ${item}`).join('\n')}` },
-    { role: 'user', content: `当前正文：\n${String(currentContent || '').slice(0, 60000)}` },
+    { role: 'user', content: `本轮可编辑候选正文（anchor/target_text 必须逐字从这里复制；未展示正文不作为本轮修改目标）：\n${String(currentContent || '').trim()}` },
     { role: 'user', content: `待修复内容：\n${String(invalidContent || '').slice(0, 24000)}` },
   ];
 }
@@ -4805,11 +4919,17 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     const currentContent = getLeafContentForWords(item);
     const currentWords = getLeafWordCount(item);
     const selectedFactsText = resolveSelectedFactsText(getContentPlanForItem(item.id), globalFacts);
+    const editableContent = selectEditableParagraphs(
+      currentContent,
+      `${item?.title || ''} ${item?.description || ''} ${selectedFactsText}`,
+      options.mode,
+      16000,
+    );
     pauseIfRequested('正文生成已在字数调整请求前暂停，继续后将重新执行本轮。');
     const adjustment = await aiService.collectJsonResponse({
       messages: buildWordAdjustmentMessages({
         context,
-        currentContent,
+        currentContent: editableContent || currentContent,
         currentWords,
         targetWords: options.targetWords,
         mode: options.mode,
@@ -4835,7 +4955,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           throw new Error('模型返回的调整方向或粒度与当前要求不一致');
         }
       },
-      repairMessagesBuilder: (repairContext) => buildWordAdjustmentRepairMessages(repairContext, options.mode, options.granularity, currentContent),
+      repairMessagesBuilder: (repairContext) => buildWordAdjustmentRepairMessages(repairContext, options.mode, options.granularity, editableContent || currentContent),
     });
     pauseIfRequested('正文生成已在字数调整结果应用前暂停，继续后将重新执行本轮。');
     const nextContent = normalizeLeafContentForSave(applyWordAdjustmentOperations(currentContent, adjustment), item);
