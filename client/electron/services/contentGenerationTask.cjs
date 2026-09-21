@@ -903,9 +903,12 @@ function selectRelevantKnowledgeItems(items, query, options = {}) {
     .map((item, index) => ({ item, index, score: scoreKnowledgeItemRelevance(item, query) }))
     .sort((a, b) => b.score - a.score || a.index - b.index);
 
+  const positive = ranked.filter((entry) => entry.score > 0);
+  const candidates = positive.length ? positive : ranked.slice(0, Math.min(6, ranked.length));
+
   const selected = [];
   let chars = 2;
-  for (const entry of ranked) {
+  for (const entry of candidates) {
     if (selected.length >= maxItems) break;
     const value = entry.item;
     const lineChars = String(value.title || '').length + String(value.resume || '').length + 48;
@@ -924,7 +927,7 @@ function renderKnowledgeItemsForPrompt(items) {
   })).filter((item) => item.id && item.title && item.resume), null, 2);
 }
 
-function buildChapterContentPlanMessages({ chapter, parentChapters, siblingChapters, projectOverview, bidAnalysisFactsText, globalFactTitlesText, regenerateRequirement, tableRequirement, maxTables, tableTotalSections, knowledgeItems }) {
+function buildChapterContentPlanMessages({ chapter, parentChapters, siblingChapters, projectOverview, bidAnalysisFactsText, globalFactTitlesText, tenderKnowledgeText, regenerateRequirement, tableRequirement, maxTables, tableTotalSections, knowledgeItems }) {
   const chapterId = chapter.id || 'unknown';
   const chapterTitle = chapter.title || '未命名章节';
   const chapterDescription = chapter.description || '';
@@ -959,7 +962,7 @@ ${renderKnowledgeItemsForPrompt(
       selectRelevantKnowledgeItems(
         knowledgeItems,
         `${chapterTitle} ${chapterDescription}`,
-        { maxItems: 60, maxChars: 9000 },
+        { maxItems: 30, maxChars: 6000 },
       ),
     )}`,
   });
@@ -1360,7 +1363,7 @@ workspace 文件：
 5. 结合 tender-context.md 中与当前章节直接相关的招标原文要求，优先响应其中的资格、参数、工期、验收、服务、合同等约束，但不要整段照抄招标原文。
 6. 可以吸收 knowledge-contents.md 中适合当前章节的技术素材，但不要提到“知识库”“历史文档”“参考资料”或素材来源。
 7. 不要提到“原方案”“历史文档”“用户原文”或“底稿”。
-7. 严禁输出 Mermaid、PlantUML、Graphviz、flowchart、graph、sequenceDiagram 等图表代码块、mermaid.ink 链接或图片 Markdown。
+8. 严禁输出 Mermaid、PlantUML、Graphviz、flowchart、graph、sequenceDiagram 等图表代码块、mermaid.ink 链接或图片 Markdown。
 8. restored-content.md 可能包含原方案 Markdown 标题行或编号标题，例如“# 第一章...”“## 第一节...”“### 二、...”“（一）...”，这些只作为章节定位线索，不属于最终正文。
 9. 不要输出章节标题、Markdown 标题、编号标题、解释、总结或过程说明；当前章节标题会由程序统一渲染。
  10. chapter-context.md 如包含小节字数目标，应尽量遵守，但保留原方案实质内容的要求优先。
@@ -4147,7 +4150,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         selectRelevantKnowledgeItems(
           knowledgeItems,
           contexts.map(({ item }) => `${item.title || ''} ${item.description || ''}`).join('\n'),
-          { maxItems: 80, maxChars: 12000 },
+          { maxItems: 30, maxChars: 7000 },
         ),
       )}` },
       { role: 'user', content: `结构化招标知识快照：\n${tenderKnowledgeText || '未提供'}` },
@@ -4245,6 +4248,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           projectOverview,
           bidAnalysisFactsText,
           globalFactTitlesText,
+          tenderKnowledgeText,
           regenerateRequirement,
           tableRequirement,
           maxTables,
@@ -4449,7 +4453,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           outputFile: 'original-restore-result.json',
           files: buildAgentOriginalMaterialRestoreFiles({
             targets: restoreTargets,
-            originalSegments: originalPlanSegments,
+            originalSegments: unresolvedOriginalSegments,
             projectOverview,
             bidAnalysisFactsText,
             globalFactTitlesText,
