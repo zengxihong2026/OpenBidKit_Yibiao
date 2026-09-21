@@ -97,6 +97,45 @@ function buildTenderKnowledgeSnapshot({
   };
 }
 
+function selectTenderKnowledgeForQuery(snapshot, query, maxChars = 2800) {
+  const categories = snapshot?.categories && typeof snapshot.categories === 'object' ? snapshot.categories : {};
+  const labels = {
+    scope: '项目范围与目标',
+    scoring: '评分与技术要求',
+    compliance: '合规、否决与符合性',
+    qualification: '资格与人员要求',
+    response: '响应文件要求',
+    delivery: '交付、验收与服务',
+    contract: '合同与履约',
+    technical: '技术参数与标准',
+  };
+  const keywords = String(query || '')
+    .toLowerCase()
+    .match(/[\u4e00-\u9fff]{2,}|[a-z0-9][a-z0-9._/-]{1,}/g) || [];
+  const ranked = Object.entries(categories)
+    .filter(([, value]) => String(value || '').trim())
+    .map(([key, value], index) => {
+      const block = String(value || '').trim();
+      const haystack = `${labels[key] || key}\n${block}`.toLowerCase();
+      const score = keywords.reduce((sum, keyword) => {
+        const hits = haystack.split(keyword).length - 1;
+        return sum + Math.min(8, hits * 2);
+      }, 0);
+      return { key, block, index, score };
+    })
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+  const selected = [];
+  let chars = 0;
+  for (const entry of ranked) {
+    if (chars >= maxChars) break;
+    const bounded = compactText(entry.block, Math.min(1500, maxChars - chars));
+    if (!bounded) continue;
+    selected.push(`## ${labels[entry.key] || entry.key}\n${bounded}`);
+    chars += bounded.length;
+  }
+  return selected.join('\n\n');
+}
+
 function formatTenderKnowledgeForPrompt(snapshot, maxChars = 5000) {
   const source = snapshot?.categories || {};
   const labels = {
@@ -122,4 +161,5 @@ module.exports = {
   CATEGORY_QUERIES,
   buildTenderKnowledgeSnapshot,
   formatTenderKnowledgeForPrompt,
+  selectTenderKnowledgeForQuery,
 };
