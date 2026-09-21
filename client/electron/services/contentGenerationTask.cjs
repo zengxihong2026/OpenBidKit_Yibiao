@@ -5207,7 +5207,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     if (normalizedTargetId) return source.filter((target) => target.item.id === normalizedTargetId);
 
     const mode = String(options.mode || 'risk-based').trim() || 'risk-based';
-    if (mode !== 'risk-based' || source.length <= 24) return source;
+    if (mode !== 'risk-based' || source.length <= 20) return source;
 
     const ranked = source
       .map((target, index) => {
@@ -5223,7 +5223,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
 
     const targetCount = Math.min(
       source.length,
-      Math.max(8, Math.ceil(source.length * 0.4)),
+      Math.max(CONSISTENCY_RISK_AUDIT_MIN_COUNT, Math.ceil(source.length * CONSISTENCY_RISK_AUDIT_RATIO)),
     );
     const selected = ranked.slice(0, targetCount).map((entry) => entry.target);
     const selectedIds = new Set(selected.map((target) => target.item.id));
