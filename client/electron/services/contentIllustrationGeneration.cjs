@@ -11,7 +11,7 @@ const {
   getLocalImageRenderService,
 } = require('./localImageRenderService.cjs');
 
-const HTML_AGENT_THRESHOLD_CHARS = 50000;
+const HTML_AGENT_THRESHOLD_CHARS = 16000;
 const MERMAID_REPAIR_ATTEMPTS = 3;
 const HTML_LAYOUT_REPAIR_ATTEMPTS = 2;
 const GENERATED_ILLUSTRATION_PATTERN = /<!-- yibiao-illustration:start\b[^>]*-->[\s\S]*?<!-- yibiao-illustration:end -->/gi;
@@ -66,10 +66,10 @@ function buildIllustrationReference(planItem, contextById, sections) {
     const item = context?.item || {};
     const content = compactIllustrationReference(
       String(sections?.[sectionId]?.content || item.content || '').trim(),
-      9000,
+      6000,
     );
     if (!content) continue;
-    const remaining = 24000 - totalChars;
+    const remaining = 18000 - totalChars;
     if (remaining <= 0) break;
     const bounded = content.length > remaining ? compactIllustrationReference(content, remaining) : content;
     blocks.push(`## ${sectionId} ${singleLine(item.title || '未命名章节')}\n\n${bounded}`);
@@ -153,7 +153,7 @@ function buildMermaidGenerationMessages(execution) {
     },
     {
       role: 'user',
-      content: `最终图题：${title}\n\n参考正文：\n${compactIllustrationReference(execution.reference, 10000)}\n\n请返回：\n{\n  "code": "flowchart TD..."\n}`,
+      content: `最终图题：${title}\n\n参考正文：\n${compactIllustrationReference(execution.reference, 8000)}\n\n请返回：\n{\n  "code": "flowchart TD..."\n}`,
     },
   ];
 }
@@ -330,7 +330,7 @@ function getHtmlLayoutIssues(screenshot) {
 }
 
 function buildHtmlLayoutRepairPrompt(execution, html, issues, attempt) {
-  return `请修复以下用于投标文件的 HTML 图片布局。\n最终图题：${getPlannedTitle(execution)}\n修复轮次：${attempt}/${HTML_LAYOUT_REPAIR_ATTEMPTS}\n渲染诊断：${issues.join('；')}\n\n要求：保持图题和正文事实不变；宽度固定 ${HTML_DESIGN_WIDTH}px，高度原则上不超过 ${HTML_MAX_DESIGN_HEIGHT}px；正文和节点文字不得小于 24px，优先控制在 12 个主要信息节点以内，不得通过缩小字号强塞复杂内容；禁止横向溢出、文字拥挤、重叠、遮挡和截断；文字不得旋转、倒置、镜像或缩放变形；不要使用固定或粘性文字布局，文字容器应随内容增长；保留专业商务风格；输出完整 HTML 文档且不依赖网络、本地文件、在线字体或外部资源。\n\n当前 HTML：\n${String(html || '').slice(0, 60000)}`;
+  return `请修复以下用于投标文件的 HTML 图片布局。\n最终图题：${getPlannedTitle(execution)}\n修复轮次：${attempt}/${HTML_LAYOUT_REPAIR_ATTEMPTS}\n渲染诊断：${issues.join('；')}\n\n要求：保持图题和正文事实不变；宽度固定 ${HTML_DESIGN_WIDTH}px，高度原则上不超过 ${HTML_MAX_DESIGN_HEIGHT}px；正文和节点文字不得小于 24px，优先控制在 12 个主要信息节点以内，不得通过缩小字号强塞复杂内容；禁止横向溢出、文字拥挤、重叠、遮挡和截断；文字不得旋转、倒置、镜像或缩放变形；不要使用固定或粘性文字布局，文字容器应随内容增长；保留专业商务风格；输出完整 HTML 文档且不依赖网络、本地文件、在线字体或外部资源。\n\n当前 HTML：\n${String(html || '').slice(0, 30000)}`;
 }
 
 async function repairHtmlLayout({ aiService, execution, html, issues, attempt, mode, runAgentHtml }) {
