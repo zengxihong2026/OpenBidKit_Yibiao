@@ -4837,14 +4837,17 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         max_retries: 0,
       });
 
-      for (const row of result) {
+      const preparedResults = result.map((row) => {
         const context = preparedContexts.find(({ item }) => item.id === row.section_id);
-        if (!context) continue;
+        if (!context) throw new Error('批量生成结果包含未知小节：' + row.section_id);
         const item = context.item;
         const generatedContent = normalizeLeafContentForSave(row.content, item);
         if (!generatedContent || countContentWords(generatedContent) === 0) {
           throw new Error('批量生成小节无有效正文：' + item.id);
         }
+        return { context, item, generatedContent };
+      });
+      for (const { item, generatedContent } of preparedResults) {
         rememberTouchedItem(item.id);
         markGenerationCompleted(item.id);
         saveSection(item, { status: 'success', content: generatedContent, error: undefined }, generatedContent, { logs });
