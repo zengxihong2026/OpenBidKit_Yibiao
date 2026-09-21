@@ -4953,6 +4953,8 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         generatedContent = await aiService.chat({
           messages: contentMessages,
           logTitle: `${needsRestoredOptimization ? '原方案优化扩写' : '正文生成'}-${item.id}-${item.title || '未命名章节'}`,
+          stage: 'content-generation',
+          sectionId: item.id,
         });
       }
 
@@ -5649,6 +5651,8 @@ workspace 文件说明：
           }),
           logTitle: `原方案覆盖修复-${item.id}-${item.title || '未命名章节'}`,
           progressLabel: '原方案覆盖修复',
+          stage: 'original-coverage',
+          sectionId: item.id,
           failureMessage: '模型返回的原方案覆盖修复结果格式无效',
           normalizer: normalizeContentExpansionPatch,
           validator: validateContentExpansionPatch,
@@ -5956,6 +5960,8 @@ workspace 文件说明：
         const response = await aiService.collectJsonResponse({
           messages: buildOriginalCoverageAuditMessages({ target }),
           logTitle: `原方案覆盖审计-${target.item.id}-${target.item.title || '未命名章节'}`,
+          stage: 'original-coverage',
+          sectionId: target.item.id,
           progressLabel: '原方案覆盖审计',
           failureMessage: '模型返回的原方案覆盖审计结果格式无效',
           normalizer: (value) => normalizeOriginalCoverageAuditResponse(value, { allowedSourceIds, expectedNodeId: target.item.id }),
