@@ -5583,7 +5583,7 @@ workspace 文件说明：
 任务目标：
 检查并修复 technical-plan.md，使各章节正文尽量保留 original-coverage-sources.md 中对应来源段的实质内容。
 
-工作方式由你自行决定。可以搜索、分段读取、建立索引、创建草稿或中间文件，并多轮编辑 technical-plan.md；不需要按固定顺序读取文件，也不需要在单次模型输出中完成全部修复。
+工作方式由你自行决定。先阅读 technical-plan.md 索引中的风险信号和正文预览，只针对存在明显事实冲突风险的小节读取 technical-plan/section-*.md 的完整正文；不要为了确认无关小节而批量读取全部完整正文。可以搜索、分段读取、建立索引、创建草稿或中间文件，并多轮编辑 technical-plan.md；不需要在单次模型输出中完成全部修复。
 
 最终 technical-plan.md 需要满足：
 - 保留所有章节编号、章节标题、HTML 注释标记和 section id。
@@ -6202,13 +6202,15 @@ workspace 文件说明：
     const indexLines = [
       '# 技术方案正文索引',
       '',
-      '完整正文按目标小节拆分到 technical-plan/section-*.md。先根据本索引定位需要检查的小节，再按需读取对应文件。最终输出仍必须写入 technical-plan.md，并包含所有目标小节的完整内容。',
+      '先阅读本索引中的风险信号和正文预览；只有需要核实或修改某个小节时，再读取对应 technical-plan/section-*.md。最终输出仍必须写入 technical-plan.md。',
     ];
     const files = [];
     for (const [id, section] of sectionIndex.entries()) {
       const safeId = String(id).replace(/[^A-Za-z0-9._-]/g, '_');
       const path = `technical-plan/section-${safeId}.md`;
-      indexLines.push(`- ${id} ${singleLine(section.item?.title || '未命名章节')}：${path}`);
+      const risk = scoreConsistencyAuditRisk(section);
+      const preview = compactConsistencyAuditContent(section.originalContent, 1200).replace(/\n/g, ' ').slice(0, 900);
+      indexLines.push(`- ${id} ${singleLine(section.item?.title || '未命名章节')}：${path}；风险=${risk}；正文预览=${preview}`);
       files.push({
         path,
         content: `<!-- yibiao-section-start id="${id}" -->
