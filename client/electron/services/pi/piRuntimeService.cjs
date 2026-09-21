@@ -1000,6 +1000,14 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         if (continuationFiles.length) {
           await writeWorkspaceFilesAsync(workspaceDir, continuationFiles);
         }
+        stageIndex = Number.isFinite(Number(continuation.stage_index))
+          ? Number(continuation.stage_index)
+          : stageIndex + 1;
+        activeTask.stage_index = stageIndex;
+        const continuationStage = continuation.stage || `workflow_stage_${stageIndex}`;
+        activeTask.workflow_stage = continuationStage;
+        activeTask.agent_budget_stage = normalizeAgentBudgetStage(continuationStage);
+        activeTask.agent_read_budget = getAgentReadBudget(activeTask.agent_budget_stage, configStore.load());
         await writeWorkspaceFilesAsync(workspaceDir, [{
           path: 'AGENT_READ_BUDGET.md',
           content: buildAgentReadBudgetManifest(
@@ -1011,14 +1019,6 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
             ],
           ),
         }]);
-        stageIndex = Number.isFinite(Number(continuation.stage_index))
-          ? Number(continuation.stage_index)
-          : stageIndex + 1;
-        activeTask.stage_index = stageIndex;
-        const continuationStage = continuation.stage || `workflow_stage_${stageIndex}`;
-        activeTask.workflow_stage = continuationStage;
-        activeTask.agent_budget_stage = normalizeAgentBudgetStage(continuationStage);
-        activeTask.agent_read_budget = getAgentReadBudget(activeTask.agent_budget_stage, configStore.load());
         stagePrompt = continuation.prompt;
         if (continuation.compact_before_prompt === true) {
           const compactionStage = continuation.compaction_stage || `${continuationStage}_compaction`;
