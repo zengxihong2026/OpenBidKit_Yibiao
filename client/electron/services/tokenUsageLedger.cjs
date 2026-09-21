@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { getStageOutputTokenLimit } = require('./tokenBudgetPolicy.cjs');
 
 const MAX_LEDGER_ENTRIES = 5000;
 const MAX_CONTEXT_HASH_ENTRIES = 2000;
@@ -141,6 +142,7 @@ function recordTokenUsageEvent(meta = {}, usage = null, outcome = {}) {
   const entry = {
     timestamp: new Date().toISOString(),
     request_id: normalizeText(meta.requestId || meta.request_id),
+    task_id: normalizeText(meta.taskId || meta.task_id),
     stage,
     section_id: sectionId,
     batch_id: normalizeText(meta.batchId || meta.batch_id),
@@ -148,6 +150,7 @@ function recordTokenUsageEvent(meta = {}, usage = null, outcome = {}) {
     model_provider: normalizeText(meta.modelProvider || meta.model_provider),
     model_name: normalizeText(meta.modelName || meta.model_name),
     request_mode: normalizeText(meta.requestMode || meta.request_mode),
+    source_hash: normalizeText(meta.sourceHash || meta.source_hash || stableContextHash(meta.messages || meta.requestMessages || [])),
     success: outcome.success !== false,
     duration_ms: Math.max(0, normalizePositiveInteger(outcome.durationMs ?? meta.durationMs)),
     input_tokens: normalizedUsage.input_tokens,
@@ -161,6 +164,9 @@ function recordTokenUsageEvent(meta = {}, usage = null, outcome = {}) {
     prompt_chars: measured.chars,
     message_count: measured.message_count,
     context_hash: stableContextHash(meta.messages || meta.requestMessages || []),
+    output_budget_tokens: getStageOutputTokenLimit(stage, meta.config || {}),
+    output_over_budget: getStageOutputTokenLimit(stage, meta.config || {}) > 0
+      && normalizedUsage.output_tokens > getStageOutputTokenLimit(stage, meta.config || {}),
     retry_count: normalizePositiveInteger(meta.retryCount ?? meta.retry_count),
     error: normalizeText(outcome.error || meta.error).slice(0, 240),
   };
@@ -196,6 +202,7 @@ function recordTokenUsageEvent(meta = {}, usage = null, outcome = {}) {
       cached_tokens: 0,
       prompt_chars: 0,
       stages: {},
+      task_ids: {},
       last_seen: '',
     };
     contextAggregate.request_count += 1;
@@ -206,6 +213,7 @@ function recordTokenUsageEvent(meta = {}, usage = null, outcome = {}) {
     contextAggregate.prompt_chars += entry.prompt_chars;
     contextAggregate.last_seen = entry.timestamp;
     contextAggregate.stages[entry.stage] = (contextAggregate.stages[entry.stage] || 0) + 1;
+    if (entry.task_id) contextAggregate.task_ids[entry.task_id] = (contextAggregate.task_ids[entry.task_id] || 0) + 1;
     ledger.by_context_hash[entry.context_hash] = contextAggregate;
     const contextKeys = Object.keys(ledger.by_context_hash);
     if (contextKeys.length > MAX_CONTEXT_HASH_ENTRIES) {
