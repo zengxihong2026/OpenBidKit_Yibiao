@@ -76,6 +76,7 @@ async function mergeSegmentedAiResults({
     messages: buildMergeMessages({ segmentResults, taskPrompt, output, systemPrompt, sectionHint, taskLabel }),
     response_format: output === 'json' ? { type: 'json_object' } : undefined,
     logTitle: logTitle || `分段结果合并-${taskLabel || 'AI任务'}`,
+    stage: 'tender-analysis',
   });
 }
 
