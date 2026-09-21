@@ -6225,13 +6225,15 @@ ${String(section.originalContent || '').trim()}
     const indexLines = [
       '# 原方案覆盖来源索引',
       '',
-      '每个目标小节对应一个来源文件。先根据索引定位，再按需读取对应来源文件。',
+      '先阅读来源段预览和风险提示；只有需要核实某个来源段时，再按索引读取对应来源文件。',
     ];
     const files = [];
     for (const target of targets || []) {
       const id = String(target.item?.id || 'unknown').replace(/[^A-Za-z0-9._-]/g, '_');
       const path = `original-coverage-sources/section-${id}.md`;
-      indexLines.push(`- ${target.item?.id || 'unknown'} ${singleLine(target.item?.title || '未命名章节')}：${path}`);
+      const preview = formatOriginalCoverageSources(target.sources).replace(/\n/g, ' ').slice(0, 1800);
+      const risk = scoreConsistencyAuditRisk(target);
+      indexLines.push(`- ${target.item?.id || 'unknown'} ${singleLine(target.item?.title || '未命名章节')}：${path}；风险=${risk}；来源预览=${preview}`);
       files.push({
         path,
         content: [
@@ -6273,7 +6275,7 @@ workspace 文件说明：
 任务目标：
 审计并修复 technical-plan.md，使正文不与 global-facts.md 中的全局事实变量冲突，并尽量消除正文前后矛盾。
 
-工作方式由你自行决定。可以搜索、分段读取、建立索引、创建草稿或中间文件，并多轮编辑 technical-plan.md；不需要按固定顺序读取文件，也不需要在单次模型输出中完成全部修复。
+工作方式由你自行决定。先阅读 original-coverage-sources.md 中的来源预览和风险提示，只针对需要补回的信息读取对应 original-coverage-sources/section-*.md；不要为了确认无关来源而批量读取全部来源文件。可以搜索、分段读取、建立索引、创建草稿或中间文件，并多轮编辑 technical-plan.md；不需要在单次模型输出中完成全部修复。
 
 最终 technical-plan.md 需要满足：
 - 保留所有章节编号、章节标题、HTML 注释标记和 section id。
