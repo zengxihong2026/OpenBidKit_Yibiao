@@ -1528,7 +1528,7 @@ function validateContentExpansionPatch(patch) {
 function buildContentExpansionRepairMessages({ invalidContent, issues }, currentContent = '') {
   const issueLines = (issues || []).map((item, index) => `${index + 1}. ${item}`).join('\n');
   const currentContentBlock = String(currentContent || '').trim()
-    ? [{ role: 'user', content: `当前正文，用于 replace 时逐字复制 target_text：\n${String(currentContent || '').slice(0, 60000)}` }]
+    ? [{ role: 'user', content: `当前正文，用于 replace 时逐字复制 target_text：\n${String(currentContent || '').slice(0, 18000)}` }]
     : [];
   return [
     {
@@ -5652,7 +5652,7 @@ workspace 文件说明：
           failureMessage: '模型返回的原方案覆盖修复结果格式无效',
           normalizer: normalizeContentExpansionPatch,
           validator: validateContentExpansionPatch,
-          repairMessagesBuilder: (contextForRepair) => buildContentExpansionRepairMessages(contextForRepair, currentContent),
+          repairMessagesBuilder: (contextForRepair) => buildContentExpansionRepairMessages(contextForRepair, selectEditableParagraphs(currentContent, `${item?.title || ''} ${item?.description || ''} ${JSON.stringify(coverageItems || [])}`, 'expand', 16000) || currentContent),
           max_retries: 1,
         });
         writeDeveloperLog('original_coverage.repair.response', {
