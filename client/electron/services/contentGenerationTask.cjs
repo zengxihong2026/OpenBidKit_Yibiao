@@ -60,6 +60,7 @@ const CONTENT_PLAN_VERSION = 5;
 // Token 优化：单个正文小节默认最多注入 3 条知识库正文素材；如需更多内容应通过后续局部补充，而不是把整库上下文带入每次生成。
 const CONTENT_KNOWLEDGE_TOP_K = 3;
 const CONTENT_GENERATION_BATCH_SIZE = 3;
+// 第二阶段：根据目标字数动态调整正文批量大小，短小节提高批处理密度，长小节避免单次输出过大。
 const CONTENT_FACT_TITLE_MAX = 8;
 const CONTENT_PLAN_BATCH_SIZE = 40;
 const CONTENT_PROJECT_OVERVIEW_MAX_CHARS = 2000;
@@ -5044,6 +5045,18 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     return '普通正文/无表格';
   }
 
+  function resolveContentGenerationBatchSize(groupTargets) {
+    const targets = Array.isArray(groupTargets) ? groupTargets : [];
+    if (!targets.length) return CONTENT_GENERATION_BATCH_SIZE;
+    const wordTargets = targets.map(({ item }) => computeGenerationWordTarget(wordControl, leaves.length, item));
+    const averageTarget = wordTargets.reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0) / Math.max(1, wordTargets.length);
+    const maximumTarget = Math.max(...wordTargets, 0);
+    if (maximumTarget >= 3500 || averageTarget >= 3200) return 2;
+    if (maximumTarget >= 2500 || averageTarget >= 2200) return 3;
+    if (maximumTarget >= 1500 || averageTarget >= 1200) return 4;
+    return 5;
+  }
+
   async function runContentTargetsWithWarmup(targets, label = '正文生成') {
     if (!targets.length) return;
 
@@ -5063,15 +5076,18 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         ? groupTargets.filter((context) => !simulatedFailureItemIds.has(context.item.id))
         : [];
       const batches = [];
+      const adaptiveBatchSize = batchable
+        ? resolveContentGenerationBatchSize(eligible)
+        : CONTENT_GENERATION_BATCH_SIZE;
       if (batchable) {
-        for (let index = 0; index < eligible.length; index += CONTENT_GENERATION_BATCH_SIZE) {
-          batches.push(eligible.slice(index, index + CONTENT_GENERATION_BATCH_SIZE));
+        for (let index = 0; index < eligible.length; index += adaptiveBatchSize) {
+          batches.push(eligible.slice(index, index + adaptiveBatchSize));
         }
       }
 
       if (batches.length) {
         const [warmupBatch, ...remainingBatches] = batches;
-        logs = [...logs, '开始' + label + '批量预热（' + formatContentPromptWarmupLabel(key) + '）：' + warmupBatch.map(({ item }) => item.id).join('、') + '。'];
+        logs = [...logs, '开始' + label + '批量预热（' + formatContentPromptWarmupLabel(key) + '）：' + warmupBatch.map(({ item }) => item.id).join('、') + '；动态批次大小 ' + adaptiveBatchSize + '。'];
         publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
         await runNormalContentBatch(warmupBatch);
         continueAfterPromptCacheWarmup(label + '批量预热完成，继续处理剩余 ' + remainingBatches.length + ' 个批次。');
