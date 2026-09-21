@@ -370,6 +370,8 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         getActivityContext: () => activeTask ? {
           task_token: activeTask.task_token,
           task_id: activeTask.task_id,
+          workflow_stage: activeTask.workflow_stage || '',
+          stage: activeTask.stage || '',
           queue_scope_id: activeTask.queue_scope_id,
         } : null,
         verifyLoopback: true,
