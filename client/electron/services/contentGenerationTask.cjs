@@ -58,6 +58,7 @@ const CONTENT_GENERATION_PAUSED = 'CONTENT_GENERATION_PAUSED';
 const CONTENT_PLAN_VERSION = 5;
 // Token 优化：单个正文小节默认最多注入 3 条知识库正文素材；如需更多内容应通过后续局部补充，而不是把整库上下文带入每次生成。
 const CONTENT_KNOWLEDGE_TOP_K = 3;
+const CONTENT_GENERATION_BATCH_SIZE = 3;
 const CONTENT_FACT_TITLE_MAX = 8;
 const CONTENT_PLAN_BATCH_SIZE = 40;
 const CONTENT_PROJECT_OVERVIEW_MAX_CHARS = 2000;
@@ -4696,6 +4697,171 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
   }
 
+
+  function buildContentGenerationBatchMessages(contexts) {
+    const sourceContexts = Array.isArray(contexts) ? contexts : [];
+    if (!sourceContexts.length) return [];
+
+    const first = sourceContexts[0];
+    const firstMessages = buildChapterContentMessages({
+      chapter: first.item,
+      projectOverview,
+      selectedFactsText: first.selectedFactsText,
+      tenderContextText: first.tenderContextText,
+      regenerateRequirement,
+      contentPlan: first.contentPlan,
+      knowledgeContents: first.knowledgeContents || [],
+      wordControl,
+      generationTarget: first.generationTarget || 0,
+      globalFactsMode,
+    });
+
+    const systemMessage = firstMessages.find((message) => message?.role === 'system');
+    const systemContent = String(systemMessage?.content || '')
+      .replace('只生成当前章节正文', '按下方各章节分别生成正文')
+      .replace('直接返回正文。', '最终只返回批量 JSON，不要输出其他文字。');
+    const messages = [{
+      role: 'system',
+      content: systemContent || '你是投标技术方案正文编写助手，请按要求返回批量章节正文 JSON。',
+    }];
+
+    for (const context of sourceContexts) {
+      const individualMessages = buildChapterContentMessages({
+        chapter: context.item,
+        projectOverview,
+        selectedFactsText: context.selectedFactsText,
+        tenderContextText: context.tenderContextText,
+        regenerateRequirement,
+        contentPlan: context.contentPlan,
+        knowledgeContents: context.knowledgeContents || [],
+        wordControl,
+        generationTarget: context.generationTarget || 0,
+        globalFactsMode,
+      });
+      messages.push({
+        role: 'user',
+        content: '当前批量章节：' + (context.item.id || 'unknown') + ' ' + (context.item.title || '未命名章节') + '\n以下消息只针对本章节，生成结果必须写入该 section_id 对应的 content 字段。',
+      });
+      individualMessages.slice(1).forEach((message) => {
+        const text = String(message?.content || '');
+        if (/^当前章节：/.test(text)) return;
+        messages.push(message);
+      });
+    }
+
+    messages.push({
+      role: 'user',
+      content:
+        '请一次性完成以上 ' + sourceContexts.length + ' 个小节，并严格返回：\n' +
+        '{\n' +
+        '  "sections": [\n' +
+        '    {\n' +
+        '      "section_id": "1.1",\n' +
+        '      "content": "该小节完整正文，不包含章节标题、Markdown 标题、解释或总结"\n' +
+        '    }\n' +
+        '  ]\n' +
+        '}\n' +
+        '规则：\n' +
+        '1. sections 必须恰好覆盖本批次全部 section_id，不能遗漏、重复或新增。\n' +
+        '2. 每个 content 只包含对应小节正文，不得串入其他小节内容。\n' +
+        '3. 不要输出 Markdown 代码围栏或 JSON 之外的文字。\n' +
+        '4. 各小节事实、参数和承诺只使用该小节提供的上下文。',
+    });
+    return messages;
+  }
+
+  function normalizeContentGenerationBatchResponse(value, contexts) {
+    const source = value?.sections && Array.isArray(value.sections) ? value.sections : (Array.isArray(value) ? value : []);
+    const byId = new Map();
+    for (const raw of source) {
+      const id = singleLine(raw?.section_id || raw?.sectionId || raw?.node_id || raw?.nodeId);
+      if (id) byId.set(id, normalizeGeneratedMarkdown(raw?.content || raw?.text || ''));
+    }
+    return (contexts || []).map(({ item }) => ({
+      section_id: item.id,
+      content: byId.get(item.id) || '',
+    }));
+  }
+
+  function validateContentGenerationBatchResponse(value, contexts) {
+    if (!value || !Array.isArray(value)) {
+      throw new Error('正文批量生成结果必须是数组');
+    }
+    const allowedIds = new Set((contexts || []).map(({ item }) => item.id));
+    const seen = new Set();
+    for (const row of value) {
+      const id = singleLine(row?.section_id);
+      const content = String(row?.content || '').trim();
+      if (!id || !allowedIds.has(id) || seen.has(id)) {
+        throw new Error('正文批量生成结果 section_id 无效或重复：' + (id || '空'));
+      }
+      if (!content || countContentWords(content) === 0) {
+        throw new Error('正文批量生成结果内容为空：' + id);
+      }
+      seen.add(id);
+    }
+    if (seen.size !== allowedIds.size) {
+      throw new Error('正文批量生成结果缺少小节：期望 ' + allowedIds.size + '，实际 ' + seen.size);
+    }
+  }
+
+  async function runNormalContentBatch(contexts) {
+    const batch = (contexts || []).filter(Boolean);
+    if (!batch.length) return;
+    const preparedContexts = batch.map((context) => {
+      const item = context.item;
+      const contentPlan = getContentPlanForItem(item.id);
+      return {
+        ...context,
+        contentPlan,
+        knowledgeContents: resolveKnowledgeContents(contentPlan.knowledge?.item_ids, knowledgeContentMap),
+        selectedFactsText: resolveSelectedFactsText(contentPlan, globalFacts),
+        generationTarget: computeGenerationWordTarget(wordControl, leaves.length),
+        tenderContextText: getTenderContextForItem(item),
+      };
+    });
+    const batchId = 'content-generation-' + Date.now() + '-' + preparedContexts.map(({ item }) => item.id).join('-');
+
+    try {
+      logs = [...logs, '开始批量生成正文：' + preparedContexts.map(({ item }) => item.id).join('、') + '。'];
+      publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
+      const result = await aiService.collectJsonResponse({
+        messages: buildContentGenerationBatchMessages(preparedContexts),
+        logTitle: '正文批量生成-' + preparedContexts[0].item.id + '-' + preparedContexts[preparedContexts.length - 1].item.id,
+        progressLabel: '正文批量生成',
+        stage: 'content-generation',
+        batchId,
+        failureMessage: '模型返回的正文批量生成结果格式无效',
+        normalizer: (value) => normalizeContentGenerationBatchResponse(value, preparedContexts),
+        validator: (value) => validateContentGenerationBatchResponse(value, preparedContexts),
+        max_retries: 0,
+      });
+
+      for (const row of result) {
+        const context = preparedContexts.find(({ item }) => item.id === row.section_id);
+        if (!context) continue;
+        const item = context.item;
+        const generatedContent = normalizeLeafContentForSave(row.content, item);
+        if (!generatedContent || countContentWords(generatedContent) === 0) {
+          throw new Error('批量生成小节无有效正文：' + item.id);
+        }
+        rememberTouchedItem(item.id);
+        markGenerationCompleted(item.id);
+        saveSection(item, { status: 'success', content: generatedContent, error: undefined }, generatedContent, { logs });
+        logs = [...logs, '批量生成完成：' + item.id + ' ' + (item.title || '未命名章节') + '。'];
+      }
+      pauseIfRequested('正文批量生成完成后暂停，可稍后继续。');
+      return;
+    } catch (error) {
+      if (isPauseLikeError(error)) throw error;
+      logs = [...logs, '正文批量生成未完成：' + preparedContexts.map(({ item }) => item.id).join('、') + '，' + (error.message || '未知错误') + '。回退为逐节生成。'];
+      publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
+      for (const context of batch) {
+        await runOne(context);
+      }
+    }
+  }
+
   async function runOne(context) {
     const { item } = context;
     const previousSection = sections[item.id] || {};
@@ -4854,9 +5020,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
   }
 
   async function runContentTargetsWithWarmup(targets, label = '正文生成') {
-    if (!targets.length) {
-      return;
-    }
+    if (!targets.length) return;
 
     const groups = new Map();
     for (const context of targets) {
@@ -4866,36 +5030,45 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
       groups.set(key, group);
     }
 
-    const warmupContexts = new Set();
-    const warmups = [];
     for (const [key, groupTargets] of groups.entries()) {
-      if (groupTargets.length <= 1) {
+      const batchable = !targetItemId
+        && key.startsWith('normal:')
+        && groupTargets.length > 1;
+      const eligible = batchable
+        ? groupTargets.filter((context) => !simulatedFailureItemIds.has(context.item.id))
+        : [];
+      const batches = [];
+      if (batchable) {
+        for (let index = 0; index < eligible.length; index += CONTENT_GENERATION_BATCH_SIZE) {
+          batches.push(eligible.slice(index, index + CONTENT_GENERATION_BATCH_SIZE));
+        }
+      }
+
+      if (batches.length) {
+        const [warmupBatch, ...remainingBatches] = batches;
+        logs = [...logs, '开始' + label + '批量预热（' + formatContentPromptWarmupLabel(key) + '）：' + warmupBatch.map(({ item }) => item.id).join('、') + '。'];
+        publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
+        await runNormalContentBatch(warmupBatch);
+        continueAfterPromptCacheWarmup(label + '批量预热完成，继续处理剩余 ' + remainingBatches.length + ' 个批次。');
+        if (remainingBatches.length) {
+          await runItemsWithWorkerPool(
+            remainingBatches,
+            Math.max(1, Math.min(contentConcurrency, remainingBatches.length)),
+            async (batch) => runNormalContentBatch(batch),
+            isPauseRequested,
+          );
+        }
+
+        const excluded = groupTargets.filter((context) => simulatedFailureItemIds.has(context.item.id));
+        if (excluded.length) {
+          await runItemsWithWorkerPool(excluded, contentConcurrency, runOne, isPauseRequested);
+        }
         continue;
       }
-      const context = groupTargets[0];
-      warmups.push({ key, context });
-      warmupContexts.add(context);
-    }
 
-    for (const { key, context } of warmups) {
-      logs = [...logs, `开始${label}预热（${formatContentPromptWarmupLabel(key)}）：${context.item.id} ${context.item.title || '未命名章节'}。`];
+      logs = [...logs, label + '开始逐节生成（' + formatContentPromptWarmupLabel(key) + '），共 ' + groupTargets.length + ' 个小节。'];
       publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
-
-      await runOne(context);
-      pauseIfRequested(`正文生成已在${label}预热后暂停，可导出当前已完成内容，稍后继续。`);
-    }
-
-    const remainingTargets = targets.filter((context) => !warmupContexts.has(context));
-
-    if (remainingTargets.length) {
-      if (warmups.length) {
-        continueAfterPromptCacheWarmup(`${label}分组预热完成，开始并发生成剩余 ${remainingTargets.length} 个小节。`);
-      }
-      logs = [...logs, warmups.length
-        ? `开始并发生成剩余 ${remainingTargets.length} 个小节。`
-        : `${label}无需分组预热，开始并发生成 ${remainingTargets.length} 个小节。`];
-      publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
-      await runItemsWithWorkerPool(remainingTargets, contentConcurrency, runOne, isPauseRequested);
+      await runItemsWithWorkerPool(groupTargets, contentConcurrency, runOne, isPauseRequested);
     }
   }
 
