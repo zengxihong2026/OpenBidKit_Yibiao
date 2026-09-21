@@ -32,7 +32,7 @@ const {
 
 const DEFAULT_CONTEXT_LENGTH_LIMIT = 400000;
 const AGENT_CONTEXT_THRESHOLD_RATIO = 0.7;
-const ORIGINAL_RESTORE_AGENT_THRESHOLD_RATIO = 0.5;
+const ORIGINAL_RESTORE_AGENT_THRESHOLD_RATIO = 0.4;
 const DEFAULT_TEXT_CONCURRENCY_LIMIT = 10;
 const DEFAULT_IMAGE_CONCURRENCY_LIMIT = 2;
 const INTERRUPTED_SECTION_ERROR = '上次生成被中断，请继续生成。';
@@ -1201,7 +1201,7 @@ function formatOriginalSegmentsForPrompt(segments) {
 ${segment.content}
 </original_segment>`).join('\n\n');
 }
-function formatOriginalSegmentsForMappingPrompt(segments, maxContentChars = 1200) {
+function formatOriginalSegmentsForMappingPrompt(segments, maxContentChars = 700) {
   return (segments || []).map((segment) => `<original_segment id="${segment.id}">
 标题路径：${segment.title_path?.length ? segment.title_path.join(' > ') : '未识别标题'}
 字符数：${segment.chars || String(segment.content || '').length}
