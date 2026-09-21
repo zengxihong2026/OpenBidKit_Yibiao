@@ -1,12 +1,27 @@
+function compactSegmentResult(value, maxChars = 5000) {
+  const text = String(value || '').trim();
+  if (!text || text.length <= maxChars) return text;
+  const head = Math.max(1, Math.floor(maxChars * 0.68));
+  const tail = Math.max(1, maxChars - head);
+  return `${text.slice(0, head)}\n…（分段解析结果已压缩）…\n${text.slice(-tail)}`;
+}
+
 function formatSegmentResults(segmentResults) {
   const items = Array.isArray(segmentResults) ? segmentResults : [];
-  return items
-    .map((item, index) => {
-      const segmentIndex = item?.segmentIndex || index + 1;
-      const totalSegments = item?.totalSegments || items.length;
-      return `## 第 ${segmentIndex}/${totalSegments} 段解析结果\n${String(item?.content || '').trim()}`;
-    })
-    .join('\n\n');
+  const blocks = [];
+  let totalChars = 0;
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const segmentIndex = item?.segmentIndex || index + 1;
+    const totalSegments = item?.totalSegments || items.length;
+    const content = compactSegmentResult(item?.content, 5000);
+    const remaining = 60000 - totalChars;
+    if (remaining <= 0) break;
+    const bounded = content.length > remaining ? compactSegmentResult(content, remaining) : content;
+    blocks.push(`## 第 ${segmentIndex}/${totalSegments} 段解析结果\n${bounded}`);
+    totalChars += bounded.length;
+  }
+  return blocks.join('\n\n');
 }
 
 function buildMergeMessages({ segmentResults, taskPrompt, output, systemPrompt, sectionHint, taskLabel }) {
