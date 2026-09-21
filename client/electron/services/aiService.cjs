@@ -113,6 +113,7 @@ function recordTextTokenStats(config, usage, request = {}) {
 
   textTokenStatsStore.recordTextTokenStats(usage);
   tokenUsageLedger.recordTokenUsageEvent({
+    config,
     requestId: request.requestId,
     logTitle: request.logTitle,
     stage: request.stage,
