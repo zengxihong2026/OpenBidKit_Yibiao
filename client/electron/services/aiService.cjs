@@ -735,6 +735,81 @@ function repairInvalidJsonStringEscapes(content) {
   return output;
 }
 
+function repairTrailingJsonCommas(content) {
+  const text = String(content || '');
+  let output = '';
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      output += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      output += char;
+      continue;
+    }
+    if (char === ',' && /\s*[}\]]/.test(text.slice(index + 1))) {
+      continue;
+    }
+    output += char;
+  }
+  return output;
+}
+
+function repairJsonControlCharacters(content) {
+  const text = String(content || '');
+  let output = '';
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        output += char;
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        output += char;
+        escaped = true;
+        continue;
+      }
+      if (char === '"') {
+        output += char;
+        inString = false;
+        continue;
+      }
+      if (char === '\n') {
+        output += '\\n';
+        continue;
+      }
+      if (char === '\r') {
+        output += '\\r';
+        continue;
+      }
+      if (char === '\t') {
+        output += '\\t';
+        continue;
+      }
+      output += char;
+      continue;
+    }
+    output += char;
+    if (char === '"') inString = true;
+  }
+  return output;
+}
+
 function parseJsonContent(content) {
   const normalized = String(content || '').replace(/^\uFEFF/, '').trim();
   const candidates = [
@@ -751,10 +826,13 @@ function parseJsonContent(content) {
 
   const repairedCandidates = [];
   for (const candidate of withBalancedCandidates) {
-    const repaired = repairInvalidJsonStringEscapes(candidate);
-    if (repaired !== candidate) {
-      repairedCandidates.push(repaired);
-    }
+    const escaped = repairInvalidJsonStringEscapes(candidate);
+    const trailingCommaRepaired = repairTrailingJsonCommas(candidate);
+    const controlCharacterRepaired = repairJsonControlCharacters(candidate);
+    const combined = repairTrailingJsonCommas(repairJsonControlCharacters(candidate));
+    [escaped, trailingCommaRepaired, controlCharacterRepaired, combined].forEach((repaired) => {
+      if (repaired !== candidate) repairedCandidates.push(repaired);
+    });
   }
 
   const uniqueCandidates = [...new Set([...withBalancedCandidates, ...repairedCandidates].map((item) => item.trim()).filter(Boolean))];
