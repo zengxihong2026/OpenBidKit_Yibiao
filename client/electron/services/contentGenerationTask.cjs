@@ -906,8 +906,8 @@ function selectRelevantKnowledgeItems(items, query, options = {}) {
     .map((item, index) => ({ item, index, score: scoreKnowledgeItemRelevance(item, query) }))
     .sort((a, b) => b.score - a.score || a.index - b.index);
 
-  const positive = ranked.filter((entry) => entry.score > 0);
-  const candidates = positive.length ? positive : ranked.slice(0, Math.min(6, ranked.length));
+  // 没有正相关命中时直接返回空集合；正文阶段宁可不带素材，也不要把无关历史案例硬塞进上下文。
+  const candidates = ranked.filter((entry) => entry.score > 0);
 
   const selected = [];
   let chars = 2;
