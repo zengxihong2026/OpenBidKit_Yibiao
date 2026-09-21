@@ -25,6 +25,7 @@ const {
 const textTokenStatsStore = require('./textTokenStatsStore.cjs');
 const tokenUsageLedger = require('./tokenUsageLedger.cjs');
 const { normalizeTokenUsage } = textTokenStatsStore;
+const { getStageOutputTokenLimit } = require('./tokenBudgetPolicy.cjs');
 
 const AI_REQUEST_TIMEOUT_MS = 600000;
 const MULTIMODAL_IMAGE_MAX_EDGE = 2048;
@@ -115,6 +116,7 @@ function recordTextTokenStats(config, usage, request = {}) {
     requestId: request.requestId,
     logTitle: request.logTitle,
     stage: request.stage,
+    taskId: request.taskId || request.task_id,
     sectionId: request.sectionId,
     batchId: request.batchId,
     modelProvider: config.text_model_provider,
@@ -939,25 +941,8 @@ function dedupeAdjacentTextMessages(messages) { // 去除请求中任意位置�
   return result;
 }
 
-const DEFAULT_STAGE_OUTPUT_TOKEN_LIMITS = Object.freeze({
-  'tender-analysis': 12000,
-  'outline-generation': 9000,
-  'global-facts': 9000,
-  'content-planning': 7000,
-  'content-generation': 16000,
-  consistency: 6000,
-  'original-restore': 6000,
-  'original-coverage': 6000,
-  'json-repair': 5000,
-  'word-adjustment': 6000,
-  'table-cleanup': 6000,
-  illustration: 12000,
-});
-
 function resolveStageOutputTokenLimit(config, stage) {
-  if (Number(config?.output_token_limit) > 0) return Number(config.output_token_limit);
-  const limit = DEFAULT_STAGE_OUTPUT_TOKEN_LIMITS[String(stage || '').trim()];
-  return Number.isFinite(limit) && limit > 0 ? limit : 0;
+  return getStageOutputTokenLimit(stage, config);
 }
 
 function applyOutputTokenLimit(body, config, stage = '') {
@@ -1592,7 +1577,7 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
       requestId,
     });
     responseData = result?.responseData ?? null;
-    recordTextTokenStats(config, result?.usage, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, sectionId: request.sectionId, batchId: request.batchId, success: true });
+    recordTextTokenStats(config, result?.usage, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, taskId: request.taskId || request.task_id, sectionId: request.sectionId, batchId: request.batchId, success: true });
     trackAiRequest(app, config, { ai_request_type: 'text', usage: result?.usage });
     analyticsTracked = true;
     writeAiLog(app, config, {
@@ -1609,7 +1594,7 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
     return result;
   } catch (error) {
     if (!analyticsTracked) {
-      recordTextTokenStats(config, null, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, sectionId: request.sectionId, batchId: request.batchId, success: false, error: error?.message || 'AI 请求失败' });
+      recordTextTokenStats(config, null, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, taskId: request.taskId || request.task_id, sectionId: request.sectionId, batchId: request.batchId, success: false, error: error?.message || 'AI 请求失败' });
       trackAiRequest(app, config, { ai_request_type: 'text' });
     }
     writeAiLog(app, config, {
