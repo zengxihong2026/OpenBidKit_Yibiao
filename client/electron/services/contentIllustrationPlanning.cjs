@@ -99,8 +99,8 @@ function buildIllustrationPlanningContext({ outlineData, sections, options, aiIm
   const eligibleCount = eligibleSectionIds.length;
   const candidateBlocks = [];
   const sectionFiles = [];
-  const candidateCharLimit = 1400;
-  const candidateTotalLimit = 60000;
+  const candidateCharLimit = 1000;
+  const candidateTotalLimit = 30000;
   let candidateChars = 0;
   for (const sectionId of eligibleSectionIds) {
     const context = sectionMap.get(sectionId);
