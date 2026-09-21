@@ -348,6 +348,8 @@ async function repairHtmlLayout({ aiService, execution, html, issues, attempt, m
   const response = await aiService.chat({
     messages: [{ role: 'user', content: `${prompt}\n\n仅返回 html 代码，不要返回其他内容。` }],
     logTitle: `HTML配图布局修复-${execution.planItem.item_id}-${getPlannedTitle(execution)}`,
+    stage: 'illustration',
+    sectionId: execution.planItem.section_ids?.[0] || '',
   });
   return validateHtmlCode(response);
 }
@@ -379,6 +381,8 @@ async function generateHtmlIllustrationInternal({ aiService, execution, plan, wo
       const response = await aiService.chat({
         messages: [{ role: 'user', content: `${buildHtmlImagePrompt(execution)}\n\n仅返回html代码，不要返回任何其他内容。` }],
         logTitle: `HTML配图-${execution.planItem.item_id}-${getPlannedTitle(execution)}`,
+        stage: 'illustration',
+        sectionId: execution.planItem.section_ids?.[0] || '',
       });
       html = validateHtmlCode(response);
     }
