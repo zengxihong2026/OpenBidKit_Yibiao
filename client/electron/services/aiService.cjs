@@ -944,11 +944,13 @@ const DEFAULT_STAGE_OUTPUT_TOKEN_LIMITS = Object.freeze({
   'outline-generation': 9000,
   'global-facts': 9000,
   'content-planning': 7000,
+  'content-generation': 16000,
   consistency: 6000,
   'original-restore': 6000,
-  'json-repair': 6000,
-  'word-adjustment': 8000,
-  'table-cleanup': 8000,
+  'original-coverage': 6000,
+  'json-repair': 5000,
+  'word-adjustment': 6000,
+  'table-cleanup': 6000,
 });
 
 function resolveStageOutputTokenLimit(config, stage) {
