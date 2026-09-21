@@ -4721,11 +4721,28 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     const systemContent = String(systemMessage?.content || '')
       .replace('只生成当前章节正文', '按下方各章节分别生成正文')
       .replace('直接返回正文。', '最终只返回批量 JSON，不要输出其他文字。');
-    const messages = [{
+
+    const commonMessages = [{
       role: 'system',
       content: systemContent || '你是投标技术方案正文编写助手，请按要求返回批量章节正文 JSON。',
     }];
 
+    // 项目概述和本次重新生成要求对整个批次相同，只注入一次，避免每个 section 重复计费。
+    const commonProjectOverview = String(projectOverview || '').trim();
+    if (commonProjectOverview) {
+      commonMessages.push({
+        role: 'user',
+        content: '本批次共用项目概述信息：\n' + compactPromptText(commonProjectOverview, CONTENT_PROJECT_OVERVIEW_MAX_CHARS),
+      });
+    }
+    if (String(regenerateRequirement || '').trim()) {
+      commonMessages.push({
+        role: 'user',
+        content: '本批次共用的用户重新生成要求：\n' + regenerateRequirement,
+      });
+    }
+
+    const messages = [...commonMessages];
     for (const context of sourceContexts) {
       const individualMessages = buildChapterContentMessages({
         chapter: context.item,
@@ -4739,15 +4756,17 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         generationTarget: context.generationTarget || 0,
         globalFactsMode,
       });
+      const sectionMessages = individualMessages.slice(1).filter((message) => {
+        const text = String(message?.content || '');
+        return !text.startsWith('项目概述信息：')
+          && !text.startsWith('用户对本次重新生成的额外要求：')
+          && !/^当前章节：/.test(text);
+      });
       messages.push({
         role: 'user',
         content: '当前批量章节：' + (context.item.id || 'unknown') + ' ' + (context.item.title || '未命名章节') + '\n以下消息只针对本章节，生成结果必须写入该 section_id 对应的 content 字段。',
       });
-      individualMessages.slice(1).forEach((message) => {
-        const text = String(message?.content || '');
-        if (/^当前章节：/.test(text)) return;
-        messages.push(message);
-      });
+      messages.push(...sectionMessages);
     }
 
     messages.push({
