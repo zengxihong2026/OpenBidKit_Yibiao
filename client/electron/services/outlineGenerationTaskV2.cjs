@@ -518,11 +518,11 @@ function buildKnowledgeFiles(knowledgeBaseService, documentIds) {
   const references = knowledgeBaseService.readReferences(documentIds, { includeMarkdown: true, includeItems: false });
   const files = [];
   let totalChars = 0;
-  const totalLimit = 20000;
+  const totalLimit = 12000;
   references.forEach((reference, index) => {
     if (totalChars >= totalLimit) return;
     const remaining = totalLimit - totalChars;
-    const compacted = compactKnowledgeMarkdown(reference?.markdown, Math.min(6000, remaining));
+    const compacted = compactKnowledgeMarkdown(reference?.markdown, Math.min(4000, remaining));
     if (!compacted) return;
     files.push({
       path: `参考知识库/参考资料-${index + 1}.md`,
