@@ -68,8 +68,8 @@ const CONTENT_TENDER_CONTEXT_SNIPPETS = 3;
 const CONTENT_KNOWLEDGE_ITEM_MAX_CHARS = 3000;
 const CONTENT_KNOWLEDGE_TOTAL_MAX_CHARS = 6000;
 const CONSISTENCY_FACT_CONTEXT_MAX_CHARS = 6000;
-const ORIGINAL_COVERAGE_SOURCE_MAX_CHARS = 3000;
-const ORIGINAL_COVERAGE_TOTAL_SOURCE_CHARS = 10000;
+const ORIGINAL_COVERAGE_SOURCE_MAX_CHARS = 2200;
+const ORIGINAL_COVERAGE_TOTAL_SOURCE_CHARS = 7000;
 const CONSISTENCY_RISK_AUDIT_RATIO = 0.35;
 const CONSISTENCY_RISK_AUDIT_MIN_COUNT = 8;
 const TABLE_REQUIREMENT_LABELS = {
@@ -1867,7 +1867,7 @@ function formatConsistencyAuditGroupContent(group) {
 标题：${entry.item.title || '未命名章节'}
 路径：${formatChapterPath(entry)}
 正文（保留事实敏感行及首尾上下文）：
-${compactConsistencyAuditContent(entry.content, 5000)}
+${compactConsistencyAuditContent(entry.content, 3500)}
 </section>`).join('\n\n');
 }
 
