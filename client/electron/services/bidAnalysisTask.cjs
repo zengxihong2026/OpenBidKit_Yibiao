@@ -593,6 +593,17 @@ async function runKeyBidAnalysisBundle({ aiService, fileContent, sectionHint, te
 async function runBidAnalysisPromptTask(options) {
   const content = await runBidAnalysisPromptTaskOnce(options);
   if (!isMissingMarkdownResult(options.task, content)) return content;
+  const taskId = options.task?.id || '';
+  const retrievalHint = TASK_RETRIEVAL_HINTS[taskId] || '';
+  if (retrievalHint && options.tenderContextIndex) {
+    const probe = retrieveTenderContext(options.tenderContextIndex, retrievalHint, {
+      maxSnippets: 1,
+      maxChars: 1200,
+    });
+    if (!(probe?.snippets || []).length) {
+      return content;
+    }
+  }
   return runBidAnalysisPromptTaskOnce(options);
 }
 
