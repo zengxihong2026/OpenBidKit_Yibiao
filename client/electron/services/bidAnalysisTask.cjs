@@ -9,9 +9,9 @@ const {
 
 const PROMPT_CACHE_WARMUP_DELAY_MS = 5000;
 const TENDER_ANALYSIS_RETRIEVAL_THRESHOLD_CHARS = 24000;
-const TENDER_ANALYSIS_DEFAULT_RETRIEVAL_CHARS = 10000;
-const TENDER_ANALYSIS_BROAD_RETRIEVAL_CHARS = 18000;
-const TENDER_ANALYSIS_MAX_SNIPPETS = 10;
+const TENDER_ANALYSIS_DEFAULT_RETRIEVAL_CHARS = 8000;
+const TENDER_ANALYSIS_BROAD_RETRIEVAL_CHARS = 16000;
+const TENDER_ANALYSIS_MAX_SNIPPETS = 8;
 
 const TASK_RETRIEVAL_HINTS = {
   projectOverview: '项目名称 项目背景 项目概况 项目目标 项目规模 预算 实施内容 建设内容 技术特点 实施范围 时间安排',
@@ -291,6 +291,15 @@ function buildTaskRetrievalQuery(task, sectionHint) {
   return [hint, sectionHint || ''].filter(Boolean).join('\n');
 }
 
+function compactPromptText(value, maxChars) {
+  const text = String(value || '').trim();
+  const limit = Math.max(0, Number(maxChars) || 0);
+  if (!text || !limit || text.length <= limit) return text;
+  const head = Math.max(1, Math.floor(limit * 0.72));
+  const tail = Math.max(1, limit - head);
+  return \`${text.slice(0, head)}\\n…（招标解析上下文已压缩）…\\n${text.slice(-tail)}\`;
+}
+
 function buildTenderAnalysisBundleContext(fileContent, taskIds, sectionHint, tenderContextIndex) {
   const source = String(fileContent || '');
   if (!source.trim()) return source;
@@ -301,13 +310,13 @@ function buildTenderAnalysisBundleContext(fileContent, taskIds, sectionHint, ten
     .filter(Boolean)
     .join('\n');
   const result = retrieveTenderContext(tenderContextIndex || source, query, {
-    maxSnippets: 12,
+    maxSnippets: TENDER_ANALYSIS_MAX_SNIPPETS,
     maxChars: TENDER_ANALYSIS_BROAD_RETRIEVAL_CHARS,
   });
   const retrieved = formatTenderContextForPrompt(result);
-  return retrieved.length >= 1600
+  return retrieved
     ? '以下为关键招标解析任务共用的招标文件高相关片段。请严格基于这些片段完成各字段；片段没有的信息不要猜测。\n\n' + retrieved
-    : source;
+    : compactPromptText(source, TENDER_ANALYSIS_BROAD_RETRIEVAL_CHARS);
 }
 
 function buildOptionalBidAnalysisBundleMessages(fileContent, taskIds, sectionHint, tenderContextIndex) {
@@ -455,10 +464,10 @@ function buildTenderAnalysisContext(fileContent, task, sectionHint, tenderContex
     maxChars,
   });
   const retrieved = formatTenderContextForPrompt(result);
-  if (retrieved.length >= 1200) {
+  if (retrieved) {
     return '以下为与“' + (task?.label || '当前解析任务') + '”最相关的招标文件原文片段。请基于这些片段完成任务；如某个字段在片段中没有出现，请填写“没有提及”，不要猜测。\n\n' + retrieved;
   }
-  return source;
+  return compactPromptText(source, maxChars);
 }
 
 function buildTenderContextMessages(fileContent, sectionHint) {
