@@ -165,6 +165,15 @@ const bridge = {
       return () => ipcRenderer.removeListener('developer-token-stats:changed', listener);
     },
   },
+  developerTokenLedger: {
+    get: (options) => ipcRenderer.invoke('developer-token-ledger:get', options),
+    reset: () => ipcRenderer.invoke('developer-token-ledger:reset'),
+    onChanged: (callback) => {
+      const listener = (_event, payload) => callback(payload);
+      ipcRenderer.on('developer-token-ledger:changed', listener);
+      return () => ipcRenderer.removeListener('developer-token-ledger:changed', listener);
+    },
+  },
   developerAgentMonitor: {
     openWindow: () => ipcRenderer.invoke('developer-agent-monitor:open-window'),
     openWorkspace: (workspaceDir) => ipcRenderer.invoke('developer-agent-monitor:open-workspace', workspaceDir),

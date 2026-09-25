@@ -903,6 +903,8 @@ async function prepareProxyResponse({ app, config, runtimeMeta, requestId, reque
 
 async function requestAgentChatCompletion({ app, aiService, runtimeMeta, openAiBody, signal, normalRequestTimeoutMs, streamIdleTimeoutMs, diagnostics, onActivity, activityContext, consumeResponse }) {
   const proxyRequestId = crypto.randomUUID();
+  const activityStage = String(activityContext?.workflow_stage || activityContext?.stage || '').trim();
+  const activityTaskId = String(activityContext?.task_id || '').trim();
   let queuedConfig = null;
   try { queuedConfig = aiService.getConfig(); } catch {}
   appendProxyDiagnostic(diagnostics, 'proxy.chat.queued', {
@@ -950,6 +952,8 @@ async function requestAgentChatCompletion({ app, aiService, runtimeMeta, openAiB
         body: openAiBody,
         signal: timeout.signal,
         queueScopeId: activityContext?.queue_scope_id || '',
+        stage: activityStage,
+        taskId: activityTaskId,
         logTitle: runtimeMeta.displayName,
         onRequestStart(context) {
           stopQueueWaitingActivity();

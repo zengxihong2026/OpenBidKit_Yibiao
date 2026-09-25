@@ -1,6 +1,6 @@
 const crypto = require('node:crypto');
 
-const ILLUSTRATION_PLAN_VERSION = 3;
+const ILLUSTRATION_PLAN_VERSION = 4;
 const ROOT_PARENT_ID = '__root__';
 const ILLUSTRATION_KINDS = ['html', 'ai', 'mermaid'];
 const ILLUSTRATION_KIND_ORDER = new Map(ILLUSTRATION_KINDS.map((kind, index) => [kind, index]));
@@ -45,6 +45,7 @@ function resolveSectionContent(item, sections) {
 // 从真实目录树构建 Agent 输入和程序校验索引。
 function buildIllustrationPlanningContext({ outlineData, sections, options, aiImagesAvailable = false }) {
   const sectionMap = new Map();
+  const itemById = new Map();
   const eligibleSectionIds = [];
   const markdownLines = ['# 技术方案正文', ''];
 
@@ -72,6 +73,7 @@ function buildIllustrationPlanningContext({ outlineData, sections, options, aiIm
         markdownLines.push('');
       }
 
+      itemById.set(id, item);
       sectionMap.set(id, {
         id,
         parentId,
@@ -95,6 +97,26 @@ function buildIllustrationPlanningContext({ outlineData, sections, options, aiIm
 
   const outline = visit(outlineData?.outline || []);
   const eligibleCount = eligibleSectionIds.length;
+  const candidateBlocks = [];
+  const sectionFiles = [];
+  const candidateCharLimit = 1000;
+  const candidateTotalLimit = 30000;
+  let candidateChars = 0;
+  for (const sectionId of eligibleSectionIds) {
+    const context = sectionMap.get(sectionId);
+    if (!context) continue;
+    const item = itemById.get(sectionId);
+    const content = resolveSectionContent(item || {}, sections);
+    const path = `technical-plan/section-${sectionId.replace(/[^A-Za-z0-9._-]/g, '_')}.md`;
+    sectionFiles.push({ path, content });
+    if (candidateChars >= candidateTotalLimit) continue;
+    const bounded = content.length > candidateCharLimit
+      ? `${content.slice(0, 1050)}\n…（仅规划预览，完整正文按需读取）…\n${content.slice(-250)}`
+      : content;
+    if (candidateChars + bounded.length > candidateTotalLimit) continue;
+    candidateBlocks.push(`## ${sectionId} ${singleLine(item?.title || context.id)}\n章节描述：${singleLine(item?.description || '')}\n正文预览：\n${bounded}`);
+    candidateChars += bounded.length;
+  }
   const allowedHtmlTypes = parseHtmlImageTypes(options?.htmlImageTypes);
   const config = {
     ai: {
@@ -125,7 +147,21 @@ function buildIllustrationPlanningContext({ outlineData, sections, options, aiIm
     eligibleSectionIds,
     config,
     files: [
-      { path: 'technical-plan.md', content: markdownLines.join('\n').trim() },
+      {
+        path: 'technical-plan.md',
+        content: [
+          '# 技术方案正文索引',
+          '',
+          '完整正文已按小节拆分为 technical-plan/section-*.md。先使用 illustration-candidates.md 做配图筛选，只有需要核实候选正文时再读取对应完整小节文件。',
+          ...eligibleSectionIds.map((id) => {
+            const item = findOutlineItemById(outlineData?.outline || [], id);
+            const content = resolveSectionContent(item || {}, sections);
+            return `- ${id} ${singleLine(item?.title || '未命名章节')}：约 ${content.length} 字，完整文件 technical-plan/section-${id.replace(/[^A-Za-z0-9._-]/g, '_')}.md`;
+          }),
+        ].join('\n'),
+      },
+      { path: 'illustration-candidates.md', content: candidateBlocks.join('\n\n') },
+      ...sectionFiles,
       {
         path: 'outline-tree.json',
         content: JSON.stringify({
@@ -143,7 +179,8 @@ function buildIllustrationPlanningContext({ outlineData, sections, options, aiIm
 function buildIllustrationPlanningPrompt() {
   return `请基于当前工作目录中的三个输入文件完成投标文件技术方案的全文图片编排，即按要求设计投标文件应该在哪个位置，添加什么样的图片：
 
-- technical-plan.md：投标文件全文，叶子小节由 yibiao-section-start / yibiao-section-end 标记。
+- technical-plan.md：技术方案正文索引，完整正文拆分在 technical-plan/section-*.md。
+- illustration-candidates.md：所有可编排小节的正文预览，用于先做低成本配图候选筛选；除非需要核实具体段落，否则不要批量读取完整正文。
 - outline-tree.json：目录树，用于核对小节 ID、父子关系和顺序，要确保配图的位置一定是真实存在于目录树中的。
 - illustration-config.json：三类图片是否启用、允许类型、类型中文说明、上限和可编排小节 ID。
 

@@ -23,7 +23,9 @@ const {
   writeAiLog,
 } = require('../utils/aiLog.cjs');
 const textTokenStatsStore = require('./textTokenStatsStore.cjs');
+const tokenUsageLedger = require('./tokenUsageLedger.cjs');
 const { normalizeTokenUsage } = textTokenStatsStore;
+const { getStageOutputTokenLimit } = require('./tokenBudgetPolicy.cjs');
 
 const AI_REQUEST_TIMEOUT_MS = 600000;
 const MULTIMODAL_IMAGE_MAX_EDGE = 2048;
@@ -104,16 +106,48 @@ function getTextTokenStatsSnapshot() {
   return textTokenStatsStore.getTextTokenStatsSnapshot();
 }
 
-function recordTextTokenStats(config, usage) {
+function recordTextTokenStats(config, usage, request = {}) {
   if (!config?.developer_mode) {
     return;
   }
 
   textTokenStatsStore.recordTextTokenStats(usage);
+  tokenUsageLedger.recordTokenUsageEvent({
+    config,
+    requestId: request.requestId,
+    logTitle: request.logTitle,
+    stage: request.stage,
+    taskId: request.taskId || request.task_id,
+    sectionId: request.sectionId,
+    batchId: request.batchId,
+    modelProvider: config.text_model_provider,
+    modelName: config.model_name,
+    requestMode: request.requestMode,
+    messages: request.messages,
+    retryCount: request.retryCount,
+  }, usage, {
+    success: request.success !== false,
+    durationMs: request.durationMs,
+    error: request.error,
+  });
 }
 
 function resetTextTokenStats() {
-  return textTokenStatsStore.resetTextTokenStats();
+  textTokenStatsStore.resetTextTokenStats();
+  tokenUsageLedger.resetLedger();
+  return textTokenStatsStore.getTextTokenStatsSnapshot();
+}
+
+function getTokenUsageLedger(options) {
+  return tokenUsageLedger.getLedgerSnapshot(options);
+}
+
+function onTokenUsageLedgerChanged(listener) {
+  return tokenUsageLedger.onLedgerChanged(listener);
+}
+
+function resetTokenUsageLedger() {
+  return tokenUsageLedger.resetLedger();
 }
 
 function onTextTokenStatsChanged(listener) {
@@ -701,6 +735,81 @@ function repairInvalidJsonStringEscapes(content) {
   return output;
 }
 
+function repairTrailingJsonCommas(content) {
+  const text = String(content || '');
+  let output = '';
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      output += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      output += char;
+      continue;
+    }
+    if (char === ',' && /\s*[}\]]/.test(text.slice(index + 1))) {
+      continue;
+    }
+    output += char;
+  }
+  return output;
+}
+
+function repairJsonControlCharacters(content) {
+  const text = String(content || '');
+  let output = '';
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        output += char;
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        output += char;
+        escaped = true;
+        continue;
+      }
+      if (char === '"') {
+        output += char;
+        inString = false;
+        continue;
+      }
+      if (char === '\n') {
+        output += '\\n';
+        continue;
+      }
+      if (char === '\r') {
+        output += '\\r';
+        continue;
+      }
+      if (char === '\t') {
+        output += '\\t';
+        continue;
+      }
+      output += char;
+      continue;
+    }
+    output += char;
+    if (char === '"') inString = true;
+  }
+  return output;
+}
+
 function parseJsonContent(content) {
   const normalized = String(content || '').replace(/^\uFEFF/, '').trim();
   const candidates = [
@@ -717,10 +826,13 @@ function parseJsonContent(content) {
 
   const repairedCandidates = [];
   for (const candidate of withBalancedCandidates) {
-    const repaired = repairInvalidJsonStringEscapes(candidate);
-    if (repaired !== candidate) {
-      repairedCandidates.push(repaired);
-    }
+    const escaped = repairInvalidJsonStringEscapes(candidate);
+    const trailingCommaRepaired = repairTrailingJsonCommas(candidate);
+    const controlCharacterRepaired = repairJsonControlCharacters(candidate);
+    const combined = repairTrailingJsonCommas(repairJsonControlCharacters(candidate));
+    [escaped, trailingCommaRepaired, controlCharacterRepaired, combined].forEach((repaired) => {
+      if (repaired !== candidate) repairedCandidates.push(repaired);
+    });
   }
 
   const uniqueCandidates = [...new Set([...withBalancedCandidates, ...repairedCandidates].map((item) => item.trim()).filter(Boolean))];
@@ -833,7 +945,7 @@ async function parseOrRepairJsonResponseWithConfig(app, config, request, content
 
 async function collectJsonResponseWithConfig(app, config, request) {
   const preparedMessages = await prepareMultimodalMessages(config, request.messages);
-  const maxRetries = request.max_retries ?? 2;
+  const maxRetries = request.max_retries ?? 1;
   const totalAttempts = maxRetries + 1;
   const responseFormat = request.response_format || { type: 'json_object' };
   const progressLabel = request.progressLabel || 'JSON结果';
@@ -848,6 +960,9 @@ async function collectJsonResponseWithConfig(app, config, request) {
       timeout_ms: request.timeout_ms,
       timeout_message: request.timeout_message,
       logTitle,
+      stage: request.stage,
+      sectionId: request.sectionId,
+      batchId: request.batchId,
       signal: request.signal,
     });
 
@@ -890,13 +1005,33 @@ async function collectJsonResponseWithConfig(app, config, request) {
 }
 
 // 按文本模型设置统一输出上限，覆盖 Agent SDK 自带的长度参数。
-function applyOutputTokenLimit(body, config) {
+function dedupeAdjacentTextMessages(messages) { // 去除请求中任意位置的完全重复文本消息，避免重复上下文；非文本/多模态消息原样保留
+  const source = Array.isArray(messages) ? messages : [];
+  const result = [];
+  const seenTextMessages = new Set();
+  for (const message of source) {
+    if (!message || typeof message !== 'object') continue;
+    const content = typeof message.content === 'string' ? message.content : '';
+    const key = content ? `${message.role || ''}:text:${content}` : '';
+    if (key && seenTextMessages.has(key)) continue;
+    result.push(message);
+    if (key) seenTextMessages.add(key);
+  }
+  return result;
+}
+
+function resolveStageOutputTokenLimit(config, stage) {
+  return getStageOutputTokenLimit(stage, config);
+}
+
+function applyOutputTokenLimit(body, config, stage = '') {
   delete body.max_output_tokens;
   delete body.max_tokens;
-  if (config.output_token_limit > 0) {
-    body.max_completion_tokens = config.output_token_limit;
+  const limit = resolveStageOutputTokenLimit(config, stage);
+  if (limit > 0) {
+    body.max_completion_tokens = limit;
     // 官方只接受新字段；其他服务商保留原有的双字段请求方式。
-    if (config.text_model_provider !== 'official') body.max_tokens = config.output_token_limit;
+    if (config.text_model_provider !== 'official') body.max_tokens = limit;
   } else {
     delete body.max_completion_tokens;
   }
@@ -908,7 +1043,7 @@ function createChatRequestBody(config, request, options = {}) {
   const modelName = JINLONG_DEPRECATED_MODEL_MAP[config.model_name] || config.model_name;
   const body = {
     model: modelName,
-    messages: request.messages,
+    messages: dedupeAdjacentTextMessages(request.messages),
   };
 
   if (config.temperature_enabled) {
@@ -927,13 +1062,13 @@ function createChatRequestBody(config, request, options = {}) {
     body.response_format = request.response_format;
   }
 
-  return applyOutputTokenLimit(body, config);
+  return applyOutputTokenLimit(body, config, request.stage);
 }
 
 // 保留 Pi 工具调用协议字段，并统一应用当前文本模型配置。
-function createAgentChatRequestBody(config, sourceBody) {
+function createAgentChatRequestBody(config, sourceBody, stage = '') {
   const source = sourceBody && typeof sourceBody === 'object' ? sourceBody : {};
-  const messages = Array.isArray(source.messages) ? source.messages : [];
+  const messages = dedupeAdjacentTextMessages(Array.isArray(source.messages) ? source.messages : []);
   if (!messages.length) {
     throw new Error('Agent 代理请求缺少 messages');
   }
@@ -956,7 +1091,7 @@ function createAgentChatRequestBody(config, sourceBody) {
     delete body.reasoning_effort;
   }
 
-  return applyOutputTokenLimit(body, config);
+  return applyOutputTokenLimit(body, config, stage);
 }
 
 async function fetchChatCompletion(app, config, body, options = {}) {
@@ -1431,7 +1566,7 @@ async function chatWithConfig(app, config, request) {
     }, timeoutMs, request.signal));
 
     responseData = result.responseData;
-    recordTextTokenStats(config, result.usage);
+    recordTextTokenStats(config, result.usage, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, sectionId: request.sectionId, batchId: request.batchId, success: true });
     trackAiRequest(app, config, { ai_request_type: 'text', usage: result.usage });
     analyticsTracked = true;
     const content = result.content || '';
@@ -1452,7 +1587,7 @@ async function chatWithConfig(app, config, request) {
       ? request.timeout_message || `AI 请求超时（${timeoutMs / 1000} 秒）`
       : error.message;
     if (!analyticsTracked) {
-      recordTextTokenStats(config, null);
+      recordTextTokenStats(config, null, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, sectionId: request.sectionId, batchId: request.batchId, success: false, error: errorMessage });
       trackAiRequest(app, config, { ai_request_type: 'text' });
       analyticsTracked = true;
     }
@@ -1494,7 +1629,7 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
   }
 
   const requestId = createRequestId();
-  const requestBody = createAgentChatRequestBody(config, request.body);
+  const requestBody = createAgentChatRequestBody(config, request.body, request.stage);
   ensureMultimodalEnabled(config, requestBody.messages);
   const requestMode = requestBody.stream ? 'stream' : 'normal';
   const logTitle = resolveAiLogTitle(request, 'Pi Agent');
@@ -1521,7 +1656,7 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
       requestId,
     });
     responseData = result?.responseData ?? null;
-    recordTextTokenStats(config, result?.usage);
+    recordTextTokenStats(config, result?.usage, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, taskId: request.taskId || request.task_id, sectionId: request.sectionId, batchId: request.batchId, success: true });
     trackAiRequest(app, config, { ai_request_type: 'text', usage: result?.usage });
     analyticsTracked = true;
     writeAiLog(app, config, {
@@ -1538,7 +1673,7 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
     return result;
   } catch (error) {
     if (!analyticsTracked) {
-      recordTextTokenStats(config, null);
+      recordTextTokenStats(config, null, { requestId, logTitle, requestMode, messages: requestBody.messages, stage: request.stage, taskId: request.taskId || request.task_id, sectionId: request.sectionId, batchId: request.batchId, success: false, error: error?.message || 'AI 请求失败' });
       trackAiRequest(app, config, { ai_request_type: 'text' });
     }
     writeAiLog(app, config, {
@@ -2537,6 +2672,18 @@ function createAiService({ app, configStore }) {
 
     onTextTokenStatsChanged(listener) {
       return onTextTokenStatsChanged(listener);
+    },
+
+    getTokenUsageLedger(options) {
+      return getTokenUsageLedger(options);
+    },
+
+    resetTokenUsageLedger() {
+      return resetTokenUsageLedger();
+    },
+
+    onTokenUsageLedgerChanged(listener) {
+      return onTokenUsageLedgerChanged(listener);
     },
 
     withQueueScope(scopeId, signal) {

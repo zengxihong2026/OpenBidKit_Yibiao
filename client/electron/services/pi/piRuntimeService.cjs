@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { getDeveloperLogsDir } = require('../../utils/paths.cjs');
 const { createAgentOpenAiProxy } = require('../agent/agentOpenAiProxy.cjs');
+const { getAgentReadBudget } = require('../tokenBudgetPolicy.cjs');
 const { isExpectedAgentInterruption, resolveAgentAbortReason } = require('../agent/agentInterruption.cjs');
 const { trackAgentRuntime } = require('../agent/agentRuntimeAnalytics.cjs');
 const { preparePiEnvironment } = require('./piEnvironment.cjs');
@@ -144,6 +145,41 @@ ${task}
 4. 不要访问当前工作目录外的文件。
 5. 不要联网。
 6. 最终回复简要说明处理动作和输出文件。`;
+}
+
+function normalizeAgentBudgetStage(value) {
+  const stage = String(value || '').trim().toLowerCase();
+  if (stage.includes('tender') || stage.includes('bid-analysis')) return 'tender-analysis';
+  if (stage.includes('outline')) return 'outline-generation';
+  if (stage.includes('global-fact')) return 'global-facts';
+  if (stage.includes('content-generation') || stage.includes('restored-optimization')) return 'content-generation';
+  if (stage.includes('original-coverage')) return 'original-coverage';
+  if (stage.includes('original-restore')) return 'original-restore';
+  if (stage.includes('consistency')) return 'consistency';
+  if (stage.includes('illustration')) return 'illustration';
+  return stage;
+}
+
+function buildAgentReadBudgetManifest(stage, budget, files = []) {
+  const sourceFiles = (files || [])
+    .filter((file) => file?.path && file.path !== 'AGENT_READ_BUDGET.md')
+    .map((file) => '- ' + file.path + '（' + String(file.content || '').length + ' 字）')
+    .slice(0, 60);
+  return [
+    '# Agent 读取预算',
+    '',
+    '当前阶段：' + (stage || '未指定'),
+    '建议读取上限：总计约 ' + budget.max_total_chars + ' 字符；单文件优先控制在 ' + budget.max_file_chars + ' 字符以内；主动读取文件不超过 ' + budget.max_files + ' 个。',
+    '',
+    '读取原则：',
+    '1. 先用 ls/find 定位最相关文件，再读取必要片段，不要为了熟悉目录而逐个读取全部文件。',
+    '2. 优先读取索引、目录、结构化解析结果和与当前任务直接相关的源文件。',
+    '3. 能通过标题、关键词或行号定位时，不要整篇读取长文件。',
+    '4. 当前预算是上下文成本控制目标；确有必要时可以读取更多，但应优先使用局部片段。',
+    '',
+    '当前工作区文件：',
+    sourceFiles.join('\n') || '- 无',
+  ].join('\n');
 }
 
 function compactText(value, maxLength = 300) {
@@ -370,6 +406,8 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         getActivityContext: () => activeTask ? {
           task_token: activeTask.task_token,
           task_id: activeTask.task_id,
+          workflow_stage: activeTask.workflow_stage || '',
+          stage: activeTask.stage || '',
           queue_scope_id: activeTask.queue_scope_id,
         } : null,
         verifyLoopback: true,
@@ -724,6 +762,10 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
     const persistentSessionFile = persistentConfig?.mode === 'resume'
       ? getPersistentAgentSessionPath(app, persistentConfig.task_key, persistentTask.state.session_file)
       : '';
+    const runtimeConfig = configStore.load();
+    const agentBudgetStage = normalizeAgentBudgetStage(payload.initial_stage || persistentTask?.state.phase || '');
+    const agentReadBudget = getAgentReadBudget(agentBudgetStage, runtimeConfig);
+
     activeTask = {
       task_id: taskId,
       session_id: '',
@@ -743,6 +785,8 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
       queue_scope_id: String(payload.queue_scope_id || payload.queueScopeId || '').trim(),
       stage_index: Number(payload.initial_stage_index || persistentTask?.state.stage_index || 0),
       workflow_stage: payload.initial_stage || persistentTask?.state.phase || 'starting',
+      agent_budget_stage: agentBudgetStage,
+      agent_read_budget: agentReadBudget,
     };
     let prompt = payload.prompt || createDefaultPrompt(payload.task || '请分析当前输入文件并输出结果。', outputFile);
     if (isMonitorActive?.()) {
@@ -771,7 +815,18 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
 
     try {
       if (!persistentTask) await clearDirectoryAsync(workspaceDir);
-      await writeWorkspaceFilesAsync(workspaceDir, payload.files || []);
+      const initialAgentFiles = Array.isArray(payload.files) ? payload.files : [];
+      await writeWorkspaceFilesAsync(workspaceDir, [
+        ...initialAgentFiles,
+        {
+          path: 'AGENT_READ_BUDGET.md',
+          content: buildAgentReadBudgetManifest(
+            activeTask.agent_budget_stage,
+            activeTask.agent_read_budget,
+            initialAgentFiles,
+          ),
+        },
+      ]);
       await ensureStarted();
       const created = await createPiSession({
         workspaceDir,
@@ -951,6 +1006,19 @@ function createPiRuntimeService({ app, configStore, aiService, isMonitorActive, 
         activeTask.stage_index = stageIndex;
         const continuationStage = continuation.stage || `workflow_stage_${stageIndex}`;
         activeTask.workflow_stage = continuationStage;
+        activeTask.agent_budget_stage = normalizeAgentBudgetStage(continuationStage);
+        activeTask.agent_read_budget = getAgentReadBudget(activeTask.agent_budget_stage, configStore.load());
+        await writeWorkspaceFilesAsync(workspaceDir, [{
+          path: 'AGENT_READ_BUDGET.md',
+          content: buildAgentReadBudgetManifest(
+            activeTask.agent_budget_stage,
+            activeTask.agent_read_budget,
+            [
+              ...(Array.isArray(payload.files) ? payload.files : []),
+              ...continuationFiles,
+            ],
+          ),
+        }]);
         stagePrompt = continuation.prompt;
         if (continuation.compact_before_prompt === true) {
           const compactionStage = continuation.compaction_stage || `${continuationStage}_compaction`;

@@ -19,16 +19,27 @@ const {
 const { applyRangeEdits, findTextMatches } = require('../utils/textEdit.cjs');
 const { splitUserTextByContextLimit } = require('../utils/userTextSplitter.cjs');
 const { countReadableWords } = require('../utils/wordCount.cjs');
+const {
+  createTenderContextIndex,
+  retrieveTenderContext,
+  formatTenderContextForPrompt,
+} = require('./tenderContextRetriever.cjs');
+const {
+  buildTenderKnowledgeSnapshot,
+  formatTenderKnowledgeForPrompt,
+  selectTenderKnowledgeForQuery,
+} = require('./tenderKnowledge.cjs');
 
 const DEFAULT_CONTEXT_LENGTH_LIMIT = 400000;
 const AGENT_CONTEXT_THRESHOLD_RATIO = 0.7;
+const ORIGINAL_RESTORE_AGENT_THRESHOLD_RATIO = 0.4;
 const DEFAULT_TEXT_CONCURRENCY_LIMIT = 10;
 const DEFAULT_IMAGE_CONCURRENCY_LIMIT = 2;
 const INTERRUPTED_SECTION_ERROR = '上次生成被中断，请继续生成。';
 const MAX_WORD_ADJUSTMENT_ROUNDS = 3;
 // 全文扩写不限制有效轮数，仅在连续多轮没有增加字数时退出。
 const MAX_EXPANSION_NO_PROGRESS_ROUNDS = 3;
-const TOTAL_WORD_ADJUSTMENT_BATCH_SIZE = 10;
+const TOTAL_WORD_ADJUSTMENT_BATCH_SIZE = 20;
 const DEFAULT_SECTION_WORD_GUIDANCE = 3000;
 const TOTAL_WORD_SHRINK_SECTION_RATIO = 0.25;
 // 生成阶段按全文上限倒推每小节目标字数时使用的折扣系数，预留 AI 系统性偏高的缓冲，降低初稿超量概率。
@@ -38,13 +49,31 @@ const TOTAL_WORD_SHRINK_MIN_CAPACITY_RATIO = 0.3;
 const CONTENT_WORD_CONTROL_WARNING = '经多轮修复，字数仍未达预期，请您人工核对';
 const SECTION_WORD_CONTROL_WARNING = '字数未达预期，请您人工核对';
 const CONSISTENCY_AUDIT_GROUP_WORD_LIMIT = 300000;
+const CONSISTENCY_AUDIT_GROUP_CHAR_LIMIT = 140000;
 const CONSISTENCY_REPAIR_MAX_ATTEMPTS = 2;
 const ORIGINAL_PLAN_SEGMENT_MAX_CHARS = 6000;
 const ORIGINAL_COVERAGE_REPAIR_MAX_ATTEMPTS = 2;
 const TABLE_CLEANUP_CONTEXT_CHARS = 600;
-const TABLE_CLEANUP_BATCH_CHAR_LIMIT = 30000;
+const TABLE_CLEANUP_BATCH_CHAR_LIMIT = 20000;
 const CONTENT_GENERATION_PAUSED = 'CONTENT_GENERATION_PAUSED';
-const CONTENT_PLAN_VERSION = 4;
+const CONTENT_PLAN_VERSION = 5;
+// Token 优化：单个正文小节默认最多注入 3 条知识库正文素材；如需更多内容应通过后续局部补充，而不是把整库上下文带入每次生成。
+const CONTENT_KNOWLEDGE_TOP_K = 3;
+const CONTENT_GENERATION_BATCH_SIZE = 3;
+// 第二阶段：根据目标字数动态调整正文批量大小，短小节提高批处理密度，长小节避免单次输出过大。
+const CONTENT_FACT_TITLE_MAX = 8;
+const CONTENT_PLAN_BATCH_SIZE = 50;
+const CONTENT_PROJECT_OVERVIEW_MAX_CHARS = 2000;
+const CONTENT_SELECTED_FACTS_MAX_CHARS = 4000;
+const CONTENT_TENDER_CONTEXT_MAX_CHARS = 4000;
+const CONTENT_TENDER_CONTEXT_SNIPPETS = 3;
+const CONTENT_KNOWLEDGE_ITEM_MAX_CHARS = 3000;
+const CONTENT_KNOWLEDGE_TOTAL_MAX_CHARS = 6000;
+const CONSISTENCY_FACT_CONTEXT_MAX_CHARS = 6000;
+const ORIGINAL_COVERAGE_SOURCE_MAX_CHARS = 2200;
+const ORIGINAL_COVERAGE_TOTAL_SOURCE_CHARS = 7000;
+const CONSISTENCY_RISK_AUDIT_RATIO = 0.35;
+const CONSISTENCY_RISK_AUDIT_MIN_COUNT = 8;
 const TABLE_REQUIREMENT_LABELS = {
   none: '不要',
   light: '少量',
@@ -176,6 +205,69 @@ function resolveGlobalFactsByTitles(titles, globalFacts) {
     .map((group) => ({ title: singleLine(group.title), content: String(group.content || '').trim() }));
 }
 
+function compactPromptText(value, maxChars, options = {}) {
+  const text = String(value || '').trim();
+  const limit = Math.max(0, Number(maxChars) || 0);
+  if (!text || !limit || text.length <= limit) return text;
+  const headChars = Math.max(1, Math.floor(limit * (options.headRatio ?? 0.72)));
+  const tailChars = Math.max(1, limit - headChars);
+  return `${text.slice(0, headChars)}\n…（上下文已压缩，省略中间 ${Math.max(0, text.length - headChars - tailChars)} 字）…\n${text.slice(-tailChars)}`;
+}
+
+function compactKnowledgeContents(contents) {
+  const totalLimit = CONTENT_KNOWLEDGE_TOTAL_MAX_CHARS;
+  let remaining = totalLimit;
+  const result = [];
+  for (const content of contents || []) {
+    if (remaining <= 0) break;
+    const compacted = compactPromptText(content, Math.min(CONTENT_KNOWLEDGE_ITEM_MAX_CHARS, remaining));
+    if (!compacted) continue;
+    result.push(compacted);
+    remaining -= compacted.length;
+  }
+  return result;
+}
+
+function scoreConsistencyAuditRisk(context) {
+  const item = context?.item || {};
+  const text = `${item.title || ''}\n${item.description || ''}\n${String(context?.content || '').slice(0, 5000)}`;
+  const rules = [
+    [5, /(废标|否决|拒绝|资格审查|强制性|必须满足|不得|禁止)/],
+    [4, /(评分|评分点|评审|得分|技术参数|关键指标)/],
+    [4, /(合同|付款|质保|运维|售后|服务期限)/],
+    [3, /(工期|周期|天内|小时内|日内|交付|验收)/],
+    [3, /(人数|项目经理|技术负责人|人员|团队|驻场)/],
+    [3, /(设备|型号|品牌|规格|参数|容量|数量|功率)/],
+    [2, /(安全|应急|风险|事故|保险|合规|标准|规范)/],
+  ];
+  return rules.reduce((score, [weight, pattern]) => score + (pattern.test(text) ? weight : 0), 0);
+}
+
+function selectConsistencyAuditTargets(targets, options = {}) {
+  const source = Array.isArray(targets) ? targets : [];
+  if (!source.length) return [];
+  const mode = String(options.mode || 'risk-based').trim() || 'risk-based';
+  if (mode !== 'risk-based' || source.length <= 20) return source;
+
+  const ranked = source
+    .map((context, index) => ({ context, index, risk: scoreConsistencyAuditRisk(context) }))
+    .sort((a, b) => b.risk - a.risk || a.index - b.index);
+  const targetCount = Math.min(
+    source.length,
+    Math.max(CONSISTENCY_RISK_AUDIT_MIN_COUNT, Math.ceil(source.length * CONSISTENCY_RISK_AUDIT_RATIO)),
+  );
+  const selected = ranked.slice(0, targetCount).map((entry) => entry.context);
+  const selectedIds = new Set(selected.map((context) => context.item.id));
+  const lowRiskStep = Math.max(1, Math.floor(ranked.length / 10));
+  for (let index = Math.floor(ranked.length / 2); index < ranked.length && selected.length < targetCount + 2; index += lowRiskStep) {
+    const context = ranked[index]?.context;
+    if (context && !selectedIds.has(context.item.id)) {
+      selected.push(context);
+      selectedIds.add(context.item.id);
+    }
+  }
+  return selected.slice(0, Math.min(source.length, targetCount + 2));
+}
 function formatSelectedGlobalFactsForPrompt(globalFacts) {
   return (Array.isArray(globalFacts) ? globalFacts : [])
     .map((group) => {
@@ -585,10 +677,10 @@ function normalizeContentPlan(value, allowedKnowledgeItemIds, allowedFactTitles)
   return {
     writing_focus: singleLine(source.writing_focus || source.writingFocus || writing.focus || writing.writing_focus || writing.writingFocus),
     knowledge: {
-      item_ids: normalizeKnowledgeItemIds(rawKnowledgeItemIds, allowedKnowledgeItemIds),
+      item_ids: normalizeKnowledgeItemIds(rawKnowledgeItemIds, allowedKnowledgeItemIds).slice(0, CONTENT_KNOWLEDGE_TOP_K),
     },
     facts: {
-      titles: normalizeFactTitles(rawFactTitles, allowedFactTitles),
+      titles: normalizeFactTitles(rawFactTitles, allowedFactTitles).slice(0, CONTENT_FACT_TITLE_MAX),
     },
     table: {
       needed: tableNeeded,
@@ -782,6 +874,55 @@ function validateTableCleanupResponse(value) {
   }
 }
 
+function scoreKnowledgeItemRelevance(item, query) {
+  const keywords = extractLocalPromptKeywords(query);
+  const text = `${item?.title || ''}\n${item?.resume || ''}`.toLowerCase();
+  return keywords.reduce((score, keyword) => {
+    if (!keyword) return score;
+    const hits = text.split(keyword).length - 1;
+    return score + Math.min(6, hits * 2);
+  }, 0);
+}
+
+function extractLocalPromptKeywords(value) {
+  const source = String(value || '').toLowerCase();
+  const cjkRuns = source.match(/[\u4e00-\u9fff]{2,}/g) || [];
+  const keywords = [];
+  for (const run of cjkRuns) {
+    for (let size = 2; size <= Math.min(4, run.length); size += 1) {
+      for (let index = 0; index + size <= run.length; index += 1) {
+        keywords.push(run.slice(index, index + size));
+      }
+    }
+  }
+  const latin = source.match(/[a-z0-9][a-z0-9._/-]{1,}/g) || [];
+  return [...new Set([...keywords, ...latin].filter((item) => item.length >= 2))];
+}
+
+function selectRelevantKnowledgeItems(items, query, options = {}) {
+  const maxItems = Math.max(1, Number(options.maxItems) || 80);
+  const maxChars = Math.max(1000, Number(options.maxChars) || 12000);
+  const source = (items || []).filter((item) => item?.id && item?.title && item?.resume);
+  const ranked = source
+    .map((item, index) => ({ item, index, score: scoreKnowledgeItemRelevance(item, query) }))
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
+  // 没有正相关命中时直接返回空集合；正文阶段宁可不带素材，也不要把无关历史案例硬塞进上下文。
+  const candidates = ranked.filter((entry) => entry.score > 0);
+
+  const selected = [];
+  let chars = 2;
+  for (const entry of candidates) {
+    if (selected.length >= maxItems) break;
+    const value = entry.item;
+    const lineChars = String(value.title || '').length + String(value.resume || '').length + 48;
+    if (selected.length && chars + lineChars > maxChars) continue;
+    selected.push(value);
+    chars += lineChars;
+  }
+  return selected;
+}
+
 function renderKnowledgeItemsForPrompt(items) {
   return JSON.stringify((items || []).map((item) => ({
     id: String(item.id || '').trim(),
@@ -790,7 +931,7 @@ function renderKnowledgeItemsForPrompt(items) {
   })).filter((item) => item.id && item.title && item.resume), null, 2);
 }
 
-function buildChapterContentPlanMessages({ chapter, parentChapters, siblingChapters, projectOverview, bidAnalysisFactsText, globalFactTitlesText, regenerateRequirement, tableRequirement, maxTables, tableTotalSections, knowledgeItems }) {
+function buildChapterContentPlanMessages({ chapter, parentChapters, siblingChapters, projectOverview, bidAnalysisFactsText, globalFactTitlesText, tenderKnowledgeText, regenerateRequirement, tableRequirement, maxTables, tableTotalSections, knowledgeItems }) {
   const chapterId = chapter.id || 'unknown';
   const chapterTitle = chapter.title || '未命名章节';
   const chapterDescription = chapter.description || '';
@@ -820,11 +961,17 @@ function buildChapterContentPlanMessages({ chapter, parentChapters, siblingChapt
 
   messages.push({
     role: 'user',
-    content: `参考知识库轻量条目（只包含 id、标题和简介，不包含正文；如无合适条目，knowledge.item_ids 返回空数组）：
-${renderKnowledgeItemsForPrompt(knowledgeItems)}`,
+    content: `参考知识库轻量条目（只包含 id、标题和简介；已按当前章节相关性裁剪）：
+${renderKnowledgeItemsForPrompt(
+      selectRelevantKnowledgeItems(
+        knowledgeItems,
+        `${chapterTitle} ${chapterDescription}`,
+        { maxItems: 30, maxChars: 6000 },
+      ),
+    )}`,
   });
 
-  messages.push({ role: 'user', content: `招标文件关键信息（用于判断正文需要引用哪些事实）：\n${formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText)}` });
+  messages.push({ role: 'user', content: `结构化招标知识快照（用于判断正文需要响应哪些事实）：\n${tenderKnowledgeText || '未提供'}` });
   if (String(globalFactTitlesText || '').trim()) {
     messages.push({ role: 'user', content: `Step04 全局事实变量标题清单（编排时只能选择标题，不要输出具体变量内容）：\n${globalFactTitlesText}` });
   }
@@ -885,7 +1032,7 @@ function formatKnowledgeContentsForPrompt(contents) {
     .join('\n\n');
 }
 
-function buildChapterContentMessages({ chapter, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, preSectionInstruction, wordControl, generationTarget = 0, globalFactsMode }) {
+function buildChapterContentMessages({ chapter, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, preSectionInstruction, wordControl, generationTarget = 0, globalFactsMode }) {
   const chapterId = chapter.id || 'unknown';
   const chapterTitle = chapter.title || '未命名章节';
   const chapterDescription = chapter.description || '';
@@ -893,44 +1040,33 @@ function buildChapterContentMessages({ chapter, projectOverview, selectedFactsTe
   const messages = [
     {
       role: 'system',
-      content: `你是一个专业的标书编写专家，负责为投标文件的技术标部分生成具体内容。
-
-要求：
-1. 内容要专业、准确，与章节标题和描述保持一致。
-2. 这是技术方案，不是宣传报告，注意朴实无华，不要假大空。
-3. 语言要正式、规范，符合标书写作要求，但不要使用奇怪的连接词，不要让人觉得内容像是 AI 生成的。
-4. 内容要详细具体，避免空泛的描述。
-5. 围绕当前章节标题、描述和正文编排重点展开，保持内容聚焦。
-6. ${tableAllowed ? '可以使用 Markdown 段落、列表和表格；表格必须服务于内容表达，不要为了形式硬插。' : '只能使用 Markdown 段落、普通列表和加粗引导语，严禁输出 Markdown 表格或 HTML 表格。'}
-7. ${tableAllowed ? '正文只生成文字、列表、表格等内容，配图由系统另行处理。' : '正文只生成文字和普通列表，配图由系统另行处理。'}
-8. 严禁输出 Mermaid、PlantUML、Graphviz、flowchart、graph、sequenceDiagram 等图表代码块、mermaid.ink 链接或图片 Markdown；配图由系统另行处理。
-9. ${tableAllowed ? '表格单元格内如有多项内容，优先使用编号、顿号、分号或短句，不要使用 HTML <br> 标签。' : '如需表达多项参数、职责、流程或措施，请改用分段文字或普通列表，不要用表格模拟。'}
-10. 严禁使用 Markdown 标题语法（#、##、###、####、#####、######），也不要生成与当前章节同级或下级的伪目录标题。
-11. 如需在正文中分层表达，只能使用普通段落、无编号列表、表格或无编号加粗引导语，例如 **实施要点：**。
-12. 加粗引导语只允许写简短主题词，禁止使用任何形式的编号。
-13. 只有步骤、流程、时间顺序、操作顺序等连续性非常强的内容，才可以使用有序列表；其他分段一律使用自然段、无编号列表或无编号加粗引导语，禁止使用任何形式的编号。
-14. 直接返回章节内容，不生成标题，不要任何额外说明。
-15. 如果本章节需要使用的全局事实变量中包含相关内容，必须优先使用变量值，不得前后矛盾。
-16. 仅使用本章节提供的全局事实变量；未提供时不要主动编造具体人员、周期、质保、品牌、型号等会影响全文一致性的承诺。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\n\n${buildContentFactCompletenessInstruction(globalFactsMode)}` : ''}`,
+      content: `你是投标技术方案正文编写助手。\n要求：\n1. 只生成当前章节正文，专业、具体、朴实，围绕标题、描述、写作重点展开，不写空话。\n2. 不输出章节标题、Markdown 标题、解释或总结；加粗引导语不得使用编号。\n3. 只使用当前提供的事实、招标要求和参考素材；不得杜撰人员、日期、参数、品牌、型号、周期、承诺等具体事实，事实冲突以全局事实为准。\n4. ${tableAllowed ? '可使用表格，但只在明显提升清晰度时使用。' : '禁止 Markdown/HTML 表格。'}\n5. 禁止输出图片 Markdown、Mermaid、PlantUML、Graphviz、flowchart、graph、sequenceDiagram 或代码块。直接返回正文。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\\n\\n${buildContentFactCompletenessInstruction(globalFactsMode)}` : ''}``,
     },
   ];
 
-  if (String(projectOverview || '').trim()) {
-    messages.push({ role: 'user', content: `项目概述信息：\n${projectOverview}` });
+  const compactProjectOverview = compactPromptText(projectOverview, CONTENT_PROJECT_OVERVIEW_MAX_CHARS);
+  const compactSelectedFactsText = compactPromptText(selectedFactsText, CONTENT_SELECTED_FACTS_MAX_CHARS);
+  if (compactProjectOverview) {
+    messages.push({ role: 'user', content: `项目概述信息：\n${compactProjectOverview}` });
+  }
+  const boundedTenderContext = compactPromptText(tenderContextText, CONTENT_TENDER_CONTEXT_MAX_CHARS);
+  if (boundedTenderContext) {
+    messages.push({ role: 'user', content: `与当前章节最相关的招标文件原文片段（仅用于响应本章节要求，不要整篇复述）：\n${boundedTenderContext}` });
   }
   if (String(preSectionInstruction || '').trim()) {
     messages.push({ role: 'user', content: String(preSectionInstruction || '').trim() });
   }
-  appendSelectedFactsMessage(messages, selectedFactsText);
+  appendSelectedFactsMessage(messages, compactSelectedFactsText);
 
-  if (knowledgeContents?.length) {
+  const boundedKnowledgeContents = compactKnowledgeContents(knowledgeContents);
+  if (boundedKnowledgeContents.length) {
     messages.push({
       role: 'user',
-      content: '参考正文素材使用规则：以下内容只作为可吸收的技术素材。请改写为当前项目语境下的投标技术方案正文，不要照抄，不要提到“知识库”“历史文档”“参考资料”或素材来源。',
+      content: '参考素材仅供吸收改写；不要照抄，不要提及素材来源。',
     });
     messages.push({
       role: 'user',
-      content: `参考正文素材：\n${formatKnowledgeContentsForPrompt(knowledgeContents)}`,
+      content: `参考正文素材：\n${formatKnowledgeContentsForPrompt(boundedKnowledgeContents)}`,
     });
   }
 
@@ -950,15 +1086,9 @@ function buildChapterContentMessages({ chapter, projectOverview, selectedFactsTe
 
   messages.push({
     role: 'user',
-    content: `请为以下标书章节生成具体内容：
-
-当前章节信息：
-章节ID: ${chapterId}
-章节标题: ${chapterTitle}
-章节描述: ${chapterDescription}
-
-请结合项目概述信息、本章节全局事实变量、参考正文素材和正文编排决策，围绕当前章节标题、描述和写作重点生成详细的专业内容。
-直接返回编写的正文内容，不要输出标题、Markdown 标题、带任何形式编号的加粗引导语、伪目录标题、解释、总结等任何其他内容`,
+    content: `当前章节：${chapterId} ${chapterTitle}
+章节描述：${chapterDescription}
+请结合已提供的项目、招标、事实、素材和编排信息，直接输出当前章节正文；不要输出标题、伪目录、解释或总结。`,
   });
   const sectionWordRequirement = buildSectionWordRequirement(wordControl, false, generationTarget);
   if (sectionWordRequirement) messages.push({ role: 'user', content: sectionWordRequirement });
@@ -966,11 +1096,12 @@ function buildChapterContentMessages({ chapter, projectOverview, selectedFactsTe
   return messages;
 }
 
-function buildRestoredChapterContentMessages({ chapter, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent, wordControl, generationTarget = 0, globalFactsMode }) {
+function buildRestoredChapterContentMessages({ chapter, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent, wordControl, generationTarget = 0, globalFactsMode }) {
   const messages = buildChapterContentMessages({
     chapter,
     projectOverview,
     selectedFactsText,
+    tenderContextText,
     regenerateRequirement,
     contentPlan,
     knowledgeContents,
@@ -1072,6 +1203,15 @@ function formatOriginalSegmentsForPrompt(segments) {
 ${segment.content}
 </original_segment>`).join('\n\n');
 }
+function formatOriginalSegmentsForMappingPrompt(segments, maxContentChars = 700) {
+  return (segments || []).map((segment) => `<original_segment id="${segment.id}">
+标题路径：${segment.title_path?.length ? segment.title_path.join(' > ') : '未识别标题'}
+字符数：${segment.chars || String(segment.content || '').length}
+原文预览（仅用于归属判断，完整原文保存在 Agent 工作区中）：
+${compactPromptText(segment.content, maxContentChars)}
+</original_segment>`).join('\n\n');
+}
+
 
 function formatRestoreTargetsForPrompt(targets) {
   return (targets || []).map(({ item, parentChapters, siblingChapters }) => {
@@ -1086,6 +1226,41 @@ function formatRestoreTargetsForPrompt(targets) {
   上级章节: ${parentPath}
   同级章节: ${siblings}`;
   }).join('\n');
+}
+
+function normalizeRestoreTitleForMatch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}_-]+/gu, '')
+    .trim();
+}
+
+function autoMatchOriginalSegmentsByTitle(targets, originalSegments) {
+  const assignments = [];
+  const usedSourceIds = new Set();
+  const contexts = targets || [];
+  for (const segment of originalSegments || []) {
+    const titlePath = Array.isArray(segment?.title_path) ? segment.title_path.filter(Boolean) : [];
+    const leafTitle = normalizeRestoreTitleForMatch(titlePath[titlePath.length - 1] || '');
+    if (leafTitle.length < 4) continue;
+
+    const candidates = contexts.filter(({ item }) => {
+      const targetTitle = normalizeRestoreTitleForMatch(item?.title);
+      if (targetTitle.length < 4) return false;
+      return targetTitle === leafTitle
+        || targetTitle.includes(leafTitle)
+        || leafTitle.includes(targetTitle);
+    });
+    if (candidates.length !== 1 || usedSourceIds.has(segment.id)) continue;
+
+    assignments.push({
+      node_id: candidates[0].item.id,
+      source_ids: [segment.id],
+      reason: '标题高度确定匹配',
+    });
+    usedSourceIds.add(segment.id);
+  }
+  return assignments;
 }
 
 function buildOriginalMaterialRestoreMessages({ targets, originalSegments, projectOverview, bidAnalysisFactsText, globalFactTitlesText }) {
@@ -1110,10 +1285,10 @@ function buildOriginalMaterialRestoreMessages({ targets, originalSegments, proje
   ]
 }`,
     },
-    { role: 'user', content: `招标文件关键信息：\n${formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText)}` },
+    { role: 'user', content: `招标文件关键信息（已压缩）：\n${compactPromptText(formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText), 3500)}` },
     { role: 'user', content: `Step04 全局事实变量标题清单：\n${globalFactTitlesText || '未提供'}` },
     { role: 'user', content: `当前可还原叶子节点：\n${formatRestoreTargetsForPrompt(targets) || '无'}` },
-    { role: 'user', content: `原方案段落：\n${formatOriginalSegmentsForPrompt(originalSegments)}` },
+    { role: 'user', content: `原方案段落预览：\n${formatOriginalSegmentsForMappingPrompt(originalSegments)}` },
     { role: 'user', content: '请只返回 JSON，不要生成正文。' },
   ];
 }
@@ -1124,13 +1299,14 @@ function buildAgentOriginalMaterialRestorePrompt() {
 workspace 文件：
 - context.md：招标文件关键信息和全局事实变量标题清单。
 - restore-targets.md：当前可还原叶子节点，包含 node_id、标题、描述、上级章节和同级章节。
-- original-segments.md：原方案段落，包含 source_id、标题路径、字符数和原文。
+- original-segments-index.md：原方案段落索引，只包含 source_id、标题路径、字符数和对应分片文件。
+- original-segments/part-*.md：按批次存放原方案原文；先根据索引定位，再按需读取相关分片，避免一次性读取全部原文。
 
 工作要求：
 1. 你可以分批读取、建立索引和创建临时草稿，但最终只写入 original-restore-result.json。
 2. 只判断归属映射，严禁改写、总结或生成正文。
 3. node_id 必须逐字使用 restore-targets.md 中给出的 ID。
-4. source_ids 必须逐字使用 original-segments.md 中给出的编号。
+4. source_ids 必须逐字使用 original-segments-index.md 中给出的编号。
 5. 每个原方案段默认只分配给一个最匹配的主节点；如果完全不适合当前叶子节点，可以不分配。
 6. 优先按标题语义、章节职责、技术路线和同级章节边界归属，避免把同一内容拆散到无关章节。
 7. 如果某个原方案段只有章节标题、Markdown 标题或目录编号，没有实质正文内容，不要把它分配为正文来源；段落开头的标题行只用于判断归属。
@@ -1145,11 +1321,12 @@ workspace 文件：
 }
 
 function buildAgentOriginalMaterialRestoreFiles({ targets, originalSegments, projectOverview, bidAnalysisFactsText, globalFactTitlesText }) {
-  return [
+  const batchSize = 20;
+  const files = [
     {
       path: 'context.md',
       content: `# 招标文件关键信息
-${formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText)}
+${compactPromptText(formatBidKeyInfoForPrompt(projectOverview, bidAnalysisFactsText), 4500)}
 
 # Step04 全局事实变量标题清单
 ${globalFactTitlesText || '未提供'}`,
@@ -1159,12 +1336,27 @@ ${globalFactTitlesText || '未提供'}`,
       content: `# 当前可还原叶子节点
 ${formatRestoreTargetsForPrompt(targets) || '无'}`,
     },
-    {
-      path: 'original-segments.md',
-      content: `# 原方案段落
-${formatOriginalSegmentsForPrompt(originalSegments)}`,
-    },
   ];
+
+  const indexLines = ['# 原方案段落索引'];
+  for (let start = 0, batch = 1; start < (originalSegments || []).length; start += batchSize, batch += 1) {
+    const group = originalSegments.slice(start, start + batchSize);
+    const path = `original-segments/part-${String(batch).padStart(3, '0')}.md`;
+    for (const segment of group) {
+      indexLines.push(`- ${segment.id} | ${segment.chars || String(segment.content || '').length}字 | ${segment.title_path?.join(' > ') || '未识别标题'} | ${path}`);
+    }
+    files.push({
+      path,
+      content: group.map((segment) => `<original_segment id="${segment.id}">
+标题路径：${segment.title_path?.length ? segment.title_path.join(' > ') : '未识别标题'}
+字符数：${segment.chars || String(segment.content || '').length}
+原文：
+${segment.content}
+</original_segment>`).join('\n\n'),
+    });
+  }
+  files.splice(2, 0, { path: 'original-segments-index.md', content: indexLines.join('\n') });
+  return files;
 }
 
 function buildAgentRestoredChapterContentPrompt(globalFactsMode) {
@@ -1172,6 +1364,7 @@ function buildAgentRestoredChapterContentPrompt(globalFactsMode) {
 
 workspace 文件：
 - chapter-context.md：当前章节信息、项目概述、本章节全局事实变量、用户额外要求和正文编排决策。
+- tender-context.md：与当前章节最相关的招标文件原文片段，如无则为“无”。
 - restored-content.md：已还原正文底稿。
 - knowledge-contents.md：可参考的正文素材，如无则为“无”。
 
@@ -1180,18 +1373,19 @@ workspace 文件：
 2. 必须保留底稿中的实质信息、技术路线、服务承诺、设备参数、人员安排、周期、验收、售后和实施方法。
 3. 可以调整语序、合并重复表达、提升专业性、补充细节、增加过渡和说明，让正文更完整、更适合投标文件。
 4. 结合 chapter-context.md 中的项目概述、全局事实变量和正文编排决策；如存在冲突，以全局事实变量为准。
-5. 可以吸收 knowledge-contents.md 中适合当前章节的技术素材，但不要提到“知识库”“历史文档”“参考资料”或素材来源。
-6. 不要提到“原方案”“历史文档”“用户原文”或“底稿”。
-7. 严禁输出 Mermaid、PlantUML、Graphviz、flowchart、graph、sequenceDiagram 等图表代码块、mermaid.ink 链接或图片 Markdown。
-8. restored-content.md 可能包含原方案 Markdown 标题行或编号标题，例如“# 第一章...”“## 第一节...”“### 二、...”“（一）...”，这些只作为章节定位线索，不属于最终正文。
-9. 不要输出章节标题、Markdown 标题、编号标题、解释、总结或过程说明；当前章节标题会由程序统一渲染。
- 10. chapter-context.md 如包含小节字数目标，应尽量遵守，但保留原方案实质内容的要求优先。
+5. 结合 tender-context.md 中与当前章节直接相关的招标原文要求，优先响应其中的资格、参数、工期、验收、服务、合同等约束，但不要整段照抄招标原文。
+6. 可以吸收 knowledge-contents.md 中适合当前章节的技术素材，但不要提到“知识库”“历史文档”“参考资料”或素材来源。
+7. 不要提到“原方案”“历史文档”“用户原文”或“底稿”。
+8. 严禁输出 Mermaid、PlantUML、Graphviz、flowchart、graph、sequenceDiagram 等图表代码块、mermaid.ink 链接或图片 Markdown。
+9. restored-content.md 可能包含原方案 Markdown 标题行或编号标题，例如“# 第一章...”“## 第一节...”“### 二、...”“（一）...”，这些只作为章节定位线索，不属于最终正文。
+10. 不要输出章节标题、Markdown 标题、编号标题、解释、总结或过程说明；当前章节标题会由程序统一渲染。
+11. chapter-context.md 如包含小节字数目标，应尽量遵守，但保留原方案实质内容的要求优先。
 11. 不要修改业务数据库，程序会读取你的输出文件后自行写回。
 
 最终请把当前小节完整正文写入 optimized-section.md。该文件只能包含正文内容，不要包含标题或说明。`, globalFactsMode);
 }
 
-function buildAgentRestoredChapterContentFiles({ chapter, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent, wordControl, generationTarget = 0 }) {
+function buildAgentRestoredChapterContentFiles({ chapter, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent, wordControl, generationTarget = 0 }) {
   return [
     {
       path: 'chapter-context.md',
@@ -1207,6 +1401,9 @@ ${projectOverview || '未提供'}
 
 # 本章节需要使用的全局事实变量
 ${String(selectedFactsText || '').trim() || '未提供'}
+
+# 与当前章节最相关的招标文件原文片段
+${String(tenderContextText || '').trim() || '无'}
 
 # 用户对本次重新生成的额外要求
 ${String(regenerateRequirement || '').trim() || '无'}
@@ -1299,9 +1496,9 @@ function buildOriginalRestoreRepairMessages({ invalidContent, issues }, targets,
 6. 严禁输出正文、总结、解释或 Markdown。`,
     },
     { role: 'user', content: `当前可还原叶子节点：\n${formatRestoreTargetsForPrompt(targets) || '无'}` },
-    { role: 'user', content: `原方案段落（用于判断 source_ids 是否只有标题、编号或实质正文）：\n${formatOriginalSegmentsForPrompt(originalSegments) || '无'}` },
+    { role: 'user', content: `原方案段落预览（用于判断 source_ids 是否只有标题、编号或实质正文）：\n${formatOriginalSegmentsForMappingPrompt(originalSegments) || '无'}` },
     { role: 'user', content: `错误列表：\n${issueLines}` },
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
@@ -1333,7 +1530,7 @@ function validateContentExpansionPatch(patch) {
 function buildContentExpansionRepairMessages({ invalidContent, issues }, currentContent = '') {
   const issueLines = (issues || []).map((item, index) => `${index + 1}. ${item}`).join('\n');
   const currentContentBlock = String(currentContent || '').trim()
-    ? [{ role: 'user', content: `当前正文，用于 replace 时逐字复制 target_text：\n${String(currentContent || '').slice(0, 60000)}` }]
+    ? [{ role: 'user', content: `当前正文，用于 replace 时逐字复制 target_text：\n${String(currentContent || '').slice(0, 18000)}` }]
     : [];
   return [
     {
@@ -1353,7 +1550,7 @@ function buildContentExpansionRepairMessages({ invalidContent, issues }, current
     },
     { role: 'user', content: `错误列表：\n${issueLines}` },
     ...currentContentBlock,
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
@@ -1645,46 +1842,76 @@ function applyConsistencyRepairPatches(content, patches) {
   return { content: nextContent, appliedCount, errors, patchResults };
 }
 
+function compactConsistencyAuditContent(content, maxChars = 5000) {
+  const source = String(content || '').trim();
+  if (!source || source.length <= maxChars) return source;
+  const lines = normalizeNewlines(source).split('\n');
+  const riskPattern = /(\d|%|日期|时间|周期|期限|工期|质保|售后|验收|人员|项目经理|负责人|设备|型号|规格|参数|数量|功率|金额|预算|标准|规范|地点|地址|电话|合同|付款|培训|响应|安全|应急|保险|业绩|资质|证书|品牌)/;
+  const selected = [];
+  const seen = new Set();
+  const push = (line) => {
+    const value = String(line || '').trim();
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    selected.push(value);
+  };
+  lines.slice(0, 3).forEach(push);
+  lines.forEach((line) => { if (riskPattern.test(line)) push(line); });
+  lines.slice(-3).forEach(push);
+  let result = selected.join('\n');
+  if (result.length > maxChars) result = compactPromptText(result, maxChars);
+  return result;
+}
+
 function formatConsistencyAuditGroupContent(group) {
   return (group.items || []).map((entry) => `<section>
 编号：${entry.item.id || 'unknown'}
 标题：${entry.item.title || '未命名章节'}
 路径：${formatChapterPath(entry)}
-正文：
-${entry.content || ''}
+正文（保留事实敏感行及首尾上下文）：
+${compactConsistencyAuditContent(entry.content, 3500)}
 </section>`).join('\n\n');
 }
 
+function selectRelevantConsistencyFacts(globalFactsText, query, maxChars = 3500) {
+  const source = String(globalFactsText || '').trim();
+  if (!source) return '';
+  const blocks = source.split(/(?=^##\s+)/m).map((block) => block.trim()).filter(Boolean);
+  if (blocks.length <= 1) return compactPromptText(source, maxChars);
+  const keywords = extractLocalPromptKeywords(query);
+  const ranked = blocks.map((block, index) => {
+    const lower = block.toLowerCase();
+    const score = keywords.reduce((sum, keyword) => {
+      if (!keyword) return sum;
+      const hits = lower.split(keyword).length - 1;
+      return sum + Math.min(6, hits * 2);
+    }, 0);
+    return { block, index, score };
+  }).sort((a, b) => b.score - a.score || a.index - b.index);
+  const selected = [];
+  let chars = 0;
+  for (const entry of ranked) {
+    if (chars >= maxChars) break;
+    const bounded = compactPromptText(entry.block, Math.min(1800, maxChars - chars));
+    if (!bounded) continue;
+    selected.push(bounded);
+    chars += bounded.length;
+  }
+  return selected.join('\n\n');
+}
+
 function buildConsistencyAuditMessages({ group, globalFactsText, bidAnalysisFactsText, globalFactsMode }) {
+  const groupQuery = (group.items || []).map(({ item, content }) => `${item?.title || ''} ${item?.description || ''} ${String(content || '').slice(0, 1500)}`).join('\n');
+  const boundedGlobalFactsText = selectRelevantConsistencyFacts(globalFactsText, groupQuery, Math.min(CONSISTENCY_FACT_CONTEXT_MAX_CHARS, 3500));
+  const boundedBidAnalysisFactsText = compactPromptText(bidAnalysisFactsText, Math.floor(CONSISTENCY_FACT_CONTEXT_MAX_CHARS / 2));
   const allowedIds = (group.items || []).map(({ item }) => item.id).filter(Boolean);
   return [
     {
       role: 'user',
-      content: `你是投标技术方案全文一致性审计助手。请审计本组正文是否与给定事实冲突。
-
-要求：
-1. 只返回 JSON，不要输出解释、总结或 Markdown。
-2. 只找正文中已经明确写出、且与事实相违背的内容。
-3. 正文没有涉及某条事实时，不要报告缺失，不要建议补充。
-4. 不报告文风、质量、重复、篇幅、表达优化等问题。
-5. section_id 必须来自允许的目录编号清单，禁止编造编号。
-6. 只筛选冲突目录编号和冲突证据，不要重写正文。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\n7. 全局事实中的【待填写】不是冲突，不要要求正文补成具体值，也不要把缺失项当成需要杜撰的内容。` : ''}
-
-返回格式：
-{
-  "conflicts": [
-    {
-      "section_id": "1.2.3",
-      "fact_title": "相关事实变量标题",
-      "evidence": "正文中的冲突原文摘录",
-      "reason": "为什么与事实冲突",
-      "severity": "high"
-    }
-  ]
-}`,
+      content: `你是标书一致性审计助手，只检查当前分组正文与事实的明确冲突。\n只返回 JSON conflicts；不报告缺失、文风、重复或质量问题；section_id 只能来自清单；只给冲突证据、事实标题、原因和严重度。\n${buildContentFactCompletenessInstruction(globalFactsMode) ? '【待填写】不是冲突，不得要求杜撰具体值。' : ''}\n格式：{"conflicts":[{"section_id":"1.2.3","fact_title":"","evidence":"","reason":"","severity":"high"}]}``,
     },
-    { role: 'user', content: `Step04 全局事实变量：\n${globalFactsText || '未提供'}` },
-    { role: 'user', content: `Step02 关键解析结果（项目信息、甲方信息、交货和服务要求）：\n${bidAnalysisFactsText || '未提供'}` },
+    { role: 'user', content: `Step04 全局事实变量（已按一致性审计上下文预算压缩）：\n${boundedGlobalFactsText || '未提供'}` },
+    { role: 'user', content: `Step02 关键解析结果（已按一致性审计上下文预算压缩）：\n${boundedBidAnalysisFactsText || '未提供'}` },
     { role: 'user', content: `允许返回的目录编号清单：\n${JSON.stringify(allowedIds, null, 2)}` },
     { role: 'user', content: `待审计正文分组：\n${formatConsistencyAuditGroupContent(group)}` },
   ];
@@ -1752,11 +1979,14 @@ function buildConsistencyAuditRepairMessages({ invalidContent, issues }, allowed
 ${JSON.stringify(Array.from(allowedSectionIds || []), null, 2)}`,
     },
     { role: 'user', content: `错误列表：\n${issueLines}` },
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
 function buildConsistencyRepairMessages({ context, conflicts, globalFactsText, bidAnalysisFactsText, currentContent, attempt, failures, tableRequirement, globalFactsMode }) {
+  const repairQuery = `${context?.item?.title || ''} ${context?.item?.description || ''} ${String(currentContent || '').slice(0, 1500)}`;
+  const boundedGlobalFactsText = selectRelevantConsistencyFacts(globalFactsText, repairQuery, Math.min(CONSISTENCY_FACT_CONTEXT_MAX_CHARS, 3500));
+  const boundedBidAnalysisFactsText = compactPromptText(bidAnalysisFactsText, Math.floor(CONSISTENCY_FACT_CONTEXT_MAX_CHARS / 2));
   const { item } = context;
   const tableAllowed = normalizeTableRequirement(tableRequirement) !== 'none';
   const failureBlock = (failures || []).length
@@ -1794,11 +2024,11 @@ function buildConsistencyRepairMessages({ context, conflicts, globalFactsText, b
   ]
 }`,
     },
-    { role: 'user', content: `Step04 全局事实变量：\n${globalFactsText || '未提供'}` },
-    { role: 'user', content: `Step02 关键解析结果（项目信息、甲方信息、交货和服务要求）：\n${bidAnalysisFactsText || '未提供'}` },
+    { role: 'user', content: `Step04 全局事实变量（已按一致性修复上下文预算压缩）：\n${boundedGlobalFactsText || '未提供'}` },
+    { role: 'user', content: `Step02 关键解析结果（已按一致性修复上下文预算压缩）：\n${boundedBidAnalysisFactsText || '未提供'}` },
     { role: 'user', content: `当前小节：${item.id || 'unknown'} ${item.title || '未命名章节'}\n路径：${formatChapterPath(context)}\n描述：${item.description || ''}` },
     { role: 'user', content: `审计发现的冲突：\n${JSON.stringify(conflicts || [], null, 2)}` },
-    { role: 'user', content: `当前小节正文（带行号；patch 的 old_text/new_text 不要包含这些行号）：\n${formatContentWithLineNumbers(currentContent)}` },
+    { role: 'user', content: `当前小节正文候选行窗口（行号沿用原文；patch 的 old_text/new_text 不要包含行号；未展示正文行不作为本轮修改目标）：\n${buildEditableLineWindows(currentContent, `${repairQuery} ${JSON.stringify(conflicts || [])}`, 18000)}` },
     { role: 'user', content: `patches[*].section_id 必须是 ${item.id || 'unknown'}。修复尝试次数：${attempt}/${CONSISTENCY_REPAIR_MAX_ATTEMPTS}${failureBlock}\n请只返回 JSON。` },
   ];
 }
@@ -1869,7 +2099,7 @@ function buildConsistencyRepairJsonRepairMessages({ invalidContent, issues }, ex
 6. 如果无法修复，返回 {"patches":[]}。`,
     },
     { role: 'user', content: `错误列表：\n${issueLines}` },
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
@@ -1886,12 +2116,22 @@ function normalizeOriginalCoverageStatus(value) {
 }
 
 function formatOriginalCoverageSources(sources) {
-  return (sources || []).map((segment) => `<source id="${segment.id}">
+  const selected = [];
+  let totalChars = 0;
+  for (const segment of sources || []) {
+    if (totalChars >= ORIGINAL_COVERAGE_TOTAL_SOURCE_CHARS) break;
+    const remaining = ORIGINAL_COVERAGE_TOTAL_SOURCE_CHARS - totalChars;
+    const content = compactPromptText(segment.content, Math.min(ORIGINAL_COVERAGE_SOURCE_MAX_CHARS, remaining));
+    if (!content) continue;
+    selected.push(`<source id="${segment.id}">
 标题路径：${segment.title_path?.length ? segment.title_path.join(' > ') : '未识别标题'}
 字符数：${segment.chars || String(segment.content || '').length}
 原文：
-${segment.content || ''}
-</source>`).join('\n\n');
+${content}
+</source>`);
+    totalChars += content.length;
+  }
+  return selected.join('\n\n');
 }
 
 function buildOriginalCoverageAuditMessages({ target }) {
@@ -1899,35 +2139,12 @@ function buildOriginalCoverageAuditMessages({ target }) {
   return [
     {
       role: 'user',
-      content: `你是投标技术方案原方案覆盖审计助手。请检查当前小节正文是否保留了原方案来源段中的实质内容。
-
-要求：
-1. 只返回 JSON，不要输出解释、总结或 Markdown。
-2. 必须对每个 source_id 返回一条 items 记录，covered 也必须返回。
-3. 可接受改写、扩写、调序、合并和专业化表达；不要因为不是逐字一致就判为缺失。
-4. 重点检查原方案中的实质信息、技术路线、服务承诺、设备参数、人员安排、周期、验收、售后、实施方法是否仍然保留。
-5. status 只能是 covered、partial、missing、conflict。
-6. covered 表示核心内容已经保留；partial 表示部分核心信息缺失；missing 表示该来源段核心内容基本没有体现；conflict 表示正文与来源段核心事实明显相反或矛盾。
-7. conflict 只报告，不要求修复；partial/missing 请给出 missing_points 和 repair_suggestion。
-8. node_id 必须是当前小节编号，source_id 必须来自允许清单。
-
-返回格式：
-{
-  "items": [
-    {
-      "source_id": "P001",
-      "node_id": "当前小节编号",
-      "status": "covered",
-      "missing_points": [],
-      "repair_suggestion": ""
-    }
-  ]
-}`,
+      content: `你是原方案覆盖审计助手。只返回 JSON items。\n逐条判断每个 source_id 的核心内容在当前小节是否仍被保留：covered/partial/missing/conflict；允许改写、扩写、调序和合并，不要求逐字一致。\n只报告来源段核心事实、技术路线、参数、人员、周期、验收、售后、实施方法等实质信息；不要报告文风或质量问题。\n格式：{"items":[{"source_id":"P001","node_id":"当前小节编号","status":"covered","missing_points":[],"repair_suggestion":""}]}``,
     },
     { role: 'user', content: `当前小节：${target.item.id || 'unknown'} ${target.item.title || '未命名章节'}\n路径：${formatChapterPath(target)}\n描述：${target.item.description || ''}` },
     { role: 'user', content: `允许的 source_id：\n${JSON.stringify(allowedSourceIds, null, 2)}` },
     { role: 'user', content: `原方案来源段：\n${formatOriginalCoverageSources(target.sources)}` },
-    { role: 'user', content: `当前小节正文：\n${target.content || ''}` },
+    { role: 'user', content: `当前小节正文候选内容（优先保留与来源事实相关的段落；未展示段落不作为本轮审计证据）：\n${selectEditableParagraphs(target.content, `${target.item?.title || ''} ${target.item?.description || ''} ${formatOriginalCoverageSources(target.sources)}`, 'shrink', 14000) || String(target.content || '').slice(0, 14000)}` },
     { role: 'user', content: '请只返回覆盖审计 JSON。' },
   ];
 }
@@ -2027,7 +2244,7 @@ function buildOriginalCoverageAuditJsonRepairMessages({ invalidContent, issues }
 ${JSON.stringify(allowedSourceIds, null, 2)}`,
     },
     { role: 'user', content: `错误列表：\n${issueLines}` },
-    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 60000)}\n\`\`\`` },
+    { role: 'user', content: `待修复内容：\n\`\`\`json\n${String(invalidContent || '').slice(0, 24000)}\n\`\`\`` },
   ];
 }
 
@@ -2042,33 +2259,12 @@ function buildOriginalCoverageRepairMessages({ target, coverageItems, currentCon
   return [
     {
       role: 'user',
-      content: `你是投标技术方案正文原方案覆盖修复助手。请只针对当前小节返回一次局部补写 patch，用于补回原方案中缺失的实质内容。
-
-要求：
-1. 只返回 JSON，不要输出解释、总结或 Markdown 代码围栏。
-2. 不要返回完整正文，只返回一次 insert 或 replace 操作。
-3. operation 只能是 "insert" 或 "replace"。
-4. 优先使用 insert 在合适段落后补充缺失内容；如果正文已有同主题但内容不完整，可使用 replace 扩写该段。
-5. insert 时 anchor 填写建议插入在哪个当前正文段落之后；适合放末尾时写 "end"。
-6. replace 时 target_text 必须逐字复制当前小节正文中的完整待替换 Markdown 原文块，不得摘要、改写或只返回其中一句。
-7. replace 目标块如为 Markdown 列表、表格、引用、加粗引导块或连续多行结构，target_text 必须包含完整结构。
-8. content 只写新增或替换后的正文片段，不要包含章节标题。
-9. 必须补回审计指出的 partial/missing 核心信息，但不要提到“原方案”“来源段”“用户原文”。
-10. 不要新增图片 Markdown、Mermaid、代码块或伪目录标题，也不要选择图片 Markdown、Mermaid 或代码块作为 replace 的 target_text。
-11. 保持与当前小节职责一致，不要写其他章节内容。
-
-返回格式：
-{
-  "operation": "insert",
-  "anchor": "end",
-  "target_text": "replace 时填写逐字复制的完整待替换 Markdown 原文块，insert 时留空",
-  "content": "补写后的正文片段"
-}`,
+      content: `你是原方案覆盖修复助手。只返回一次 insert 或 replace JSON patch，不要完整重写正文。\n必须补回审计指出的 partial/missing 核心信息；不得编造事实，不得提到原方案/来源段。\nreplace 的 target_text 必须逐字且唯一命中当前正文；insert 的 anchor 也必须能唯一定位；不得修改图片、Mermaid、代码块、表格结构或章节标题。``,
     },
     { role: 'user', content: `当前小节：${target.item.id || 'unknown'} ${target.item.title || '未命名章节'}\n路径：${formatChapterPath(target)}\n描述：${target.item.description || ''}` },
     { role: 'user', content: `需要补回的原方案来源段：\n${formatOriginalCoverageSources(issueSources)}` },
     { role: 'user', content: `覆盖审计问题：\n${JSON.stringify(coverageItems || [], null, 2)}` },
-    { role: 'user', content: `当前小节正文：\n${currentContent || ''}` },
+    { role: 'user', content: `当前小节正文候选段落（仅在此范围内选择 insert anchor / replace target_text）：\n${selectEditableParagraphs(currentContent, `${target.item?.title || ''} ${target.item?.description || ''} ${JSON.stringify(coverageItems || [])}`, 'expand', 16000) || String(currentContent || '').slice(0, 16000)}` },
     { role: 'user', content: `补写尝试次数：${attempt}/${ORIGINAL_COVERAGE_REPAIR_MAX_ATTEMPTS}${failureBlock}\n请只返回 JSON。` },
   ];
 }
@@ -2384,6 +2580,120 @@ function validateWordAdjustmentResponse(value) {
   }
 }
 
+function selectEditableParagraphs(content, query, mode, maxChars = 16000) {
+  const paragraphs = normalizeParagraphs(content);
+  if (!paragraphs.length) return '';
+  const keywords = extractLocalPromptKeywords(query);
+  const riskPattern = /(参数|型号|设备|人员|项目经理|技术负责人|工期|周期|验收|质保|售后|安全|应急|合同|付款|标准|规范|响应|培训|承诺|数量|规格|金额|日期|地点)/;
+  const scored = paragraphs.map((paragraph, index) => {
+    const lower = paragraph.toLowerCase();
+    const keywordScore = keywords.reduce((sum, keyword) => {
+      const hits = lower.split(keyword).length - 1;
+      return sum + Math.min(8, hits * 2);
+    }, 0);
+    const riskScore = riskPattern.test(paragraph) ? 6 : 0;
+    const lengthScore = mode === 'shrink'
+      ? Math.min(20, Math.floor(paragraph.length / 350))
+      : Math.max(0, 12 - Math.floor(paragraph.length / 500));
+    return { paragraph, index, score: keywordScore + riskScore + lengthScore };
+  }).sort((a, b) => b.score - a.score || a.index - b.index);
+
+  const selectedIndexes = new Set();
+  const add = (index) => {
+    if (index < 0 || index >= paragraphs.length) return;
+    selectedIndexes.add(index);
+    if (selectedIndexes.size < 8) {
+      selectedIndexes.add(Math.max(0, index - 1));
+      selectedIndexes.add(Math.min(paragraphs.length - 1, index + 1));
+    }
+  };
+  add(0);
+  add(paragraphs.length - 1);
+
+  let chars = 0;
+  for (const entry of scored) {
+    if (chars >= maxChars) break;
+    add(entry.index);
+    const preview = [...selectedIndexes].sort((a, b) => a - b).map((index) => paragraphs[index]).join('\n\n');
+    if (preview.length > maxChars) {
+      selectedIndexes.delete(entry.index);
+      selectedIndexes.delete(Math.max(0, entry.index - 1));
+      selectedIndexes.delete(Math.min(paragraphs.length - 1, entry.index + 1));
+      continue;
+    }
+    chars = preview.length;
+  }
+
+  return [...selectedIndexes]
+    .sort((a, b) => a - b)
+    .map((index) => paragraphs[index])
+    .join('\n\n');
+}
+
+function buildEditableLineWindows(content, query, maxChars = 18000) {
+  const text = normalizeNewlines(content);
+  if (!text || text.length <= maxChars) return formatContentWithLineNumbers(text);
+  const lines = text.split('\n');
+  const keywords = extractLocalPromptKeywords(query);
+  const riskPattern = /(参数|型号|设备|人员|项目经理|技术负责人|工期|周期|验收|质保|售后|安全|应急|合同|付款|标准|规范|响应|培训|承诺|数量|规格|金额|日期|地点|资质|证书|业绩)/;
+  const scored = lines.map((line, index) => {
+    const lower = line.toLowerCase();
+    const keywordScore = keywords.reduce((sum, keyword) => sum + Math.min(6, (lower.split(keyword).length - 1) * 2), 0);
+    const riskScore = riskPattern.test(line) ? 8 : 0;
+    const edgeScore = index < 3 || index >= lines.length - 3 ? 3 : 0;
+    return { index, score: keywordScore + riskScore + edgeScore };
+  }).sort((a, b) => b.score - a.score || a.index - b.index);
+
+  const selected = new Set([0, 1, Math.max(0, lines.length - 2), Math.max(0, lines.length - 1)]);
+  for (const entry of scored) {
+    if (selected.size >= Math.min(lines.length, 80)) break;
+    for (let offset = -2; offset <= 2; offset += 1) {
+      const index = entry.index + offset;
+      if (index >= 0 && index < lines.length) selected.add(index);
+    }
+    const blocks = [];
+    const sorted = [...selected].sort((a, b) => a - b);
+    let start = sorted[0];
+    let previous = sorted[0];
+    for (let i = 1; i < sorted.length; i += 1) {
+      const current = sorted[i];
+      if (current !== previous + 1) {
+        blocks.push([start, previous]);
+        start = current;
+      }
+      previous = current;
+    }
+    blocks.push([start, previous]);
+    const candidate = blocks.map(([from, to]) => lines.slice(from, to + 1).map((line, offset) => {
+      const number = String(from + offset + 1).padStart(Math.max(3, String(lines.length).length), '0');
+      return `[${number}] ${line}`;
+    }).join('\n')).join('\n…（未展示无关正文行）…\n');
+    if (candidate.length > maxChars) {
+      selected.delete(entry.index);
+      for (let offset = -2; offset <= 2; offset += 1) selected.delete(entry.index + offset);
+      continue;
+    }
+  }
+
+  const sorted = [...selected].sort((a, b) => a - b);
+  const blocks = [];
+  let start = sorted[0];
+  let previous = sorted[0];
+  for (let i = 1; i < sorted.length; i += 1) {
+    const current = sorted[i];
+    if (current !== previous + 1) {
+      blocks.push([start, previous]);
+      start = current;
+    }
+    previous = current;
+  }
+  blocks.push([start, previous]);
+  return blocks.map(([from, to]) => lines.slice(from, to + 1).map((line, offset) => {
+    const number = String(from + offset + 1).padStart(Math.max(3, String(lines.length).length), '0');
+    return `[${number}] ${line}`;
+  }).join('\n')).join('\n…（未展示无关正文行）…\n');
+}
+
 function buildWordAdjustmentRepairMessages({ invalidContent, issues }, expectedMode, expectedGranularity, currentContent) {
   const operationRule = expectedMode === 'expand'
     ? '扩写只允许 insert/replace。insert 的 anchor 必须逐字复制当前正文中的唯一完整原文块，或使用 start/end；replace 的 target_text 必须逐字复制当前正文中的唯一完整目标。'
@@ -2394,8 +2704,8 @@ function buildWordAdjustmentRepairMessages({ invalidContent, issues }, expectedM
   return [
     { role: 'user', content: `请把待修复内容整理为正文局部字数调整 JSON。mode 必须是 ${expectedMode}，granularity 必须是 ${expectedGranularity}，operations 至少一项。${operationRule} content 不得包含标题、图片、Mermaid、代码块或表格，不得破坏列表层级、事实参数和服务承诺。返回格式：${responseFormat}。只返回 JSON。` },
     { role: 'user', content: `错误列表：\n${(issues || []).map((item, index) => `${index + 1}. ${item}`).join('\n')}` },
-    { role: 'user', content: `当前正文：\n${String(currentContent || '').slice(0, 60000)}` },
-    { role: 'user', content: `待修复内容：\n${String(invalidContent || '').slice(0, 60000)}` },
+    { role: 'user', content: `本轮可编辑候选正文（anchor/target_text 必须逐字从这里复制；未展示正文不作为本轮修改目标）：\n${String(currentContent || '').trim()}` },
+    { role: 'user', content: `待修复内容：\n${String(invalidContent || '').slice(0, 24000)}` },
   ];
 }
 
@@ -2426,17 +2736,7 @@ function buildWordAdjustmentMessages({ context, currentContent, currentWords, ta
   return [
     {
       role: 'user',
-      content: `你是投标技术方案正文局部编辑助手。请对当前小节执行${mode === 'expand' ? '扩写' : '缩写'}，只返回 JSON，不返回完整重写正文。
-
-JSON 格式：${responseFormat}
-
-要求：
-1. mode 和 granularity 必须与给定值一致。
-${operationRules}
-6. 不改变核心意思，不修改参数、数量、日期、周期和标准，不删除技术路线、职责、流程、风险措施、人员安排、验收要求、售后和服务承诺。
-7. 不新增未提供的品牌、型号、人员、承诺和服务期限。
-8. 不修改图片、Mermaid、代码块、表格结构、列表编号层级和资源路径，不生成 Markdown 标题或伪目录标题。
-9. 不把其他目录应承载的内容移动到当前小节。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\n\n${buildContentFactCompletenessInstruction(globalFactsMode)}` : ''}`,
+      content: `你是投标技术方案正文局部编辑助手，只返回 JSON patch，不要完整重写正文。\nmode/granularity 必须按给定值；不得改变核心事实、参数、日期、周期、标准、技术路线、职责、验收、售后和服务承诺；不得杜撰人员、品牌、型号或期限。\n${mode === 'expand' ? '扩写优先 insert，额度内可多个操作；replace 必须精确复制原文块。' : '缩写仅允许 replace/delete，目标必须精确复制原文块。'}\n禁止修改图片、Mermaid、代码块、表格结构、列表层级或章节标题；不得移动其他章节内容。${buildContentFactCompletenessInstruction(globalFactsMode) ? `\\n\\n${buildContentFactCompletenessInstruction(globalFactsMode)}` : ''}``,
     },
     { role: 'user', content: `当前章节路径：${chapterPath}\n章节描述：${item.description || ''}\n同级章节：${siblings}` },
     ...(String(selectedFactsText || '').trim() ? [{ role: 'user', content: `本章节全局事实变量：\n${selectedFactsText}` }] : []),
@@ -2954,6 +3254,41 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
 
   const projectOverview = outlineData.project_overview || storedPlan.projectOverview || '';
   const techRequirements = storedPlan.techRequirements || '';
+  let tenderMarkdown = '';
+  let tenderContextIndex = null;
+  const tenderContextCache = new Map();
+  try {
+    if (typeof workspaceStore.readTenderMarkdown === 'function') {
+      tenderMarkdown = String(workspaceStore.readTenderMarkdown() || '').trim();
+      tenderContextIndex = tenderMarkdown ? createTenderContextIndex(tenderMarkdown) : null;
+    }
+  } catch (error) {
+    tenderMarkdown = '';
+    tenderContextIndex = null;
+    writeDeveloperLog('tender_context.load.error', { error: error.message || String(error) });
+  }
+
+  const tenderKnowledgeSnapshot = buildTenderKnowledgeSnapshot({
+    tenderContextIndex,
+    tenderMarkdown,
+    bidAnalysisTasks: storedPlan.bidAnalysisTasks,
+    projectOverview,
+  });
+  const tenderKnowledgeText = formatTenderKnowledgeForPrompt(tenderKnowledgeSnapshot, 5000);
+
+  function getTenderContextForItem(item) {
+    if (!tenderMarkdown) return '';
+    const id = String(item?.id || '').trim();
+    if (id && tenderContextCache.has(id)) return tenderContextCache.get(id);
+    const query = [item?.title, item?.description].filter(Boolean).join('\n');
+    const result = retrieveTenderContext(tenderContextIndex || tenderMarkdown, query, {
+      maxSnippets: CONTENT_TENDER_CONTEXT_SNIPPETS,
+      maxChars: CONTENT_TENDER_CONTEXT_MAX_CHARS,
+    });
+    const text = formatTenderContextForPrompt(result);
+    if (id) tenderContextCache.set(id, text);
+    return text;
+  }
   if (resume && storedPlan.contentGenerationTask?.status !== 'paused') {
     throw new Error('没有可继续的已暂停正文生成任务');
   }
@@ -3082,6 +3417,9 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
   let storedContentPlans = pruneContentGenerationPlans(fullRegenerate ? {} : storedPlan.contentGenerationPlans, leaves);
   let knowledgeItems = [];
   let allowedKnowledgeItemIds = new Set();
+  logs = [...logs, tenderMarkdown
+    ? '已启用招标原文局部检索：正文生成仅注入与当前章节相关的片段。'
+    : '未读取到可用招标原文，正文生成继续使用项目概述和 Step02 关键解析结果。'];
   let knowledgeContentMap = new Map();
   let sections = createInitialSections(leaves, fullRegenerate ? {} : storedPlan.contentGenerationSections);
   const touchedItemIds = new Set(contentRuntime.touched_item_ids);
@@ -3341,7 +3679,10 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     }
 
     try {
-      const result = await agentService.runTask(payload);
+      const result = await agentService.runTask({
+        ...payload,
+        initial_stage: payload.initial_stage || eventPrefix,
+      });
       if (isAgentBusyResult(result)) {
         writeDeveloperLog(`${eventPrefix}.agent.busy`, {
           message: result?.message || 'Agent 正在处理其他任务',
@@ -3893,6 +4234,144 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     return storedContentPlans;
   }
 
+  function chunkPlanningTargets(targets, size = CONTENT_PLAN_BATCH_SIZE) {
+    const result = [];
+    for (let index = 0; index < targets.length; index += size) {
+      result.push(targets.slice(index, index + size));
+    }
+    return result;
+  }
+
+  function buildChapterContentPlanBatchMessages(contexts, tenderKnowledgeTextOverride) {
+    const rows = contexts.map(({ item, parentChapters, siblingChapters }) => {
+      const siblingText = (siblingChapters || [])
+        .filter((sibling) => sibling.id !== item.id)
+        .slice(0, 8)
+        .map((sibling) => `- ${sibling.id || 'unknown'} ${singleLine(sibling.title || '未命名章节')}：${compactPromptText(sibling.description || '', 500)}`)
+        .join('\n');
+      const parentText = (parentChapters || [])
+        .slice(-4)
+        .map((parent) => `- ${parent.id || 'unknown'} ${singleLine(parent.title || '未命名章节')}：${compactPromptText(parent.description || '', 700)}`)
+        .join('\n');
+      return [
+        `## ${item.id || 'unknown'} ${singleLine(item.title || '未命名章节')}`,
+        `章节描述：${compactPromptText(item.description || '', 1200)}`,
+        parentText ? `上级章节：\n${parentText}` : '',
+        siblingText ? `同级章节：\n${siblingText}` : '',
+      ].filter(Boolean).join('\n');
+    }).join('\n\n');
+
+    const tableRequirementLabel = TABLE_REQUIREMENT_LABELS[tableRequirement] || TABLE_REQUIREMENT_LABELS.heavy;
+    return [
+      {
+        role: 'system',
+        content: `你是投标技术方案正文编排助手。现在需要一次性为多个叶子小节做“编排决策”，以减少重复上下文输入。
+
+要求：
+1. 只返回 JSON，不要解释。
+2. 顶层对象只有 plans 数组；每个 plan 必须有 section_id、writing_focus、knowledge.item_ids、facts.titles、table.needed、table.purpose。
+3. section_id 必须逐字使用下方当前批次的小节 ID，不能遗漏、不能新增。
+4. knowledge.item_ids 只能从参考知识库轻量条目的 id 中选择，最多选择 ${CONTENT_KNOWLEDGE_TOP_K} 条。
+5. facts.titles 只能从全局事实变量标题清单中选择，最多选择 ${CONTENT_FACT_TITLE_MAX} 组。
+6. writing_focus 只写 1-2 句话，聚焦当前章节，不编造具体承诺。
+7. table.needed 依据表格需求“${tableRequirementLabel}”判断，禁止为了形式硬插。`,
+      },
+      { role: 'user', content: `参考知识库轻量条目（已按本批次小节相关性裁剪）：\n${renderKnowledgeItemsForPrompt(
+        selectRelevantKnowledgeItems(
+          knowledgeItems,
+          contexts.map(({ item }) => `${item.title || ''} ${item.description || ''}`).join('\n'),
+          { maxItems: 30, maxChars: 7000 },
+        ),
+      )}` },
+      { role: 'user', content: `结构化招标知识快照（已按本批次小节相关性裁剪）：\n${tenderKnowledgeTextOverride || '未提供'}` },
+      { role: 'user', content: `Step04 全局事实变量标题清单：\n${globalFactTitlesText || '未提供'}` },
+      { role: 'user', content: `当前批次小节：\n${rows}` },
+      { role: 'user', content: `请严格返回：
+{
+  "plans": [
+    {
+      "section_id": "1.1",
+      "writing_focus": "本节重点……",
+      "knowledge": { "item_ids": [] },
+      "facts": { "titles": [] },
+      "table": { "needed": false, "purpose": "" }
+    }
+  ]
+}\n注意：plans 必须覆盖本批次全部 section_id。` },
+    ];
+  }
+
+  function normalizeContentPlanBatchResponse(value, contexts) {
+    const source = value?.plans && Array.isArray(value.plans) ? value.plans : (Array.isArray(value) ? value : []);
+    const byId = new Map();
+    for (const raw of source) {
+      const id = singleLine(raw?.section_id || raw?.sectionId || raw?.node_id || raw?.nodeId);
+      if (id) byId.set(id, raw);
+    }
+    return contexts.map(({ item }) => ({
+      section_id: item.id,
+      plan: normalizeContentPlan(byId.get(item.id) || {}, allowedKnowledgeItemIds, allowedFactTitles),
+    }));
+  }
+
+  function validateContentPlanBatchResponse(value, contexts) {
+    if (!value || !Array.isArray(value)) throw new Error('正文批量编排结果必须是数组');
+    const allowedIds = new Set(contexts.map(({ item }) => item.id));
+    const seen = new Set();
+    for (const entry of value) {
+      const id = singleLine(entry?.section_id);
+      if (!id || !allowedIds.has(id) || seen.has(id)) {
+        throw new Error(`正文批量编排结果 section_id 无效或重复：${id || '空'}`);
+      }
+      seen.add(id);
+      validateContentPlan(entry.plan);
+    }
+    if (seen.size !== allowedIds.size) {
+      throw new Error(`正文批量编排结果缺少小节：期望 ${allowedIds.size}，实际 ${seen.size}`);
+    }
+  }
+
+  async function planBatch(contexts) {
+    if (!contexts.length) return;
+    const batchId = `content-plan-${Date.now()}-${contexts[0].item.id}`;
+    const results = await aiService.collectJsonResponse({
+      messages: buildChapterContentPlanBatchMessages(
+        contexts,
+        selectTenderKnowledgeForQuery(
+          tenderKnowledgeSnapshot,
+          contexts.map(({ item }) => `${item.title || ''} ${item.description || ''}`).join('\n'),
+          2800,
+        ),
+      ),
+      logTitle: `正文批量编排-${contexts[0].item.id}-${contexts[contexts.length - 1].item.id}`,
+      progressLabel: '正文批量编排',
+      stage: 'content-planning',
+      batchId,
+      failureMessage: '模型返回的正文批量编排结果格式无效',
+      normalizer: (value) => normalizeContentPlanBatchResponse(value, contexts),
+      validator: (value) => validateContentPlanBatchResponse(value, contexts),
+      max_retries: 1,
+    });
+
+    for (const context of contexts) {
+      const item = context.item;
+      const entry = results.find((row) => row.section_id === item.id);
+      let contentPlan = entry?.plan || normalizeContentPlan({}, allowedKnowledgeItemIds, allowedFactTitles);
+      if (tableRequirement === 'none') contentPlan = clearContentPlanTable(contentPlan);
+      contentPlans.set(item.id, contentPlan);
+      storedContentPlans = pruneContentGenerationPlans({
+        ...storedContentPlans,
+        [item.id]: createStoredContentPlan(contentPlan, tableRequirement),
+      }, leaves);
+      contentStats.planning_completed += 1;
+      logs = [...logs, `编排完成：${item.id} ${item.title || '未命名章节'}（批次：${batchId}）`];
+    }
+    const runtime = syncRuntime();
+    checkpointTask({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() }, {
+      contentGenerationPlans: storedContentPlans,
+      contentGenerationRuntime: runtime,
+    }, { contentRuntime: runtime });
+  }
   async function planOne(context, { preservedOriginalMaterial } = {}) {
     const { item, parentChapters, siblingChapters } = context;
     let contentPlan;
@@ -3906,6 +4385,11 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           projectOverview,
           bidAnalysisFactsText,
           globalFactTitlesText,
+          tenderKnowledgeText: selectTenderKnowledgeForQuery(
+            tenderKnowledgeSnapshot,
+            `${item.title || ''} ${item.description || ''}`,
+            2800,
+          ),
           regenerateRequirement,
           tableRequirement,
           maxTables,
@@ -3914,6 +4398,8 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         }),
         logTitle: `正文编排-${item.id}-${item.title || '未命名章节'}`,
         progressLabel: '正文编排决策',
+        stage: 'content-planning',
+        sectionId: item.id,
         failureMessage: '模型返回的正文编排决策格式无效',
         normalizer: (value) => normalizeContentPlan(value, allowedKnowledgeItemIds, allowedFactTitles),
         validator: validateContentPlan,
@@ -3970,18 +4456,22 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
 
     if (planningTargets.length) {
-      const [warmupTarget, ...remainingPlanningTargets] = planningTargets;
-      logs = [...logs, `开始正文编排预热：${warmupTarget.item.id} ${warmupTarget.item.title || '未命名章节'}。`];
+      const planningBatches = chunkPlanningTargets(planningTargets);
+      logs = [...logs, `批量正文编排：${planningTargets.length} 个小节合并为 ${planningBatches.length} 个批次，每批最多 ${CONTENT_PLAN_BATCH_SIZE} 个。`];
       publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
 
-      await planOne(warmupTarget);
-      pauseIfRequested('正文生成已在编排预热后暂停，可导出当前已完成内容，稍后继续。');
+      await planBatch(planningBatches[0]);
+      pauseIfRequested('正文生成已在批量编排预热后暂停，可导出当前已完成内容，稍后继续。');
 
-      if (remainingPlanningTargets.length) {
-        continueAfterPromptCacheWarmup(`正文编排预热完成，开始并发编排剩余 ${remainingPlanningTargets.length} 个小节。`);
-        logs = [...logs, `开始并发编排剩余 ${remainingPlanningTargets.length} 个小节。`];
-        publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
-        await runItemsWithWorkerPool(remainingPlanningTargets, contentConcurrency, planOne, isPauseRequested);
+      if (planningBatches.length > 1) {
+        continueAfterPromptCacheWarmup(`正文批量编排预热完成，开始并发处理剩余 ${planningBatches.length - 1} 个批次。`);
+        const remainingPlanningBatches = planningBatches.slice(1);
+        await runItemsWithWorkerPool(
+          remainingPlanningBatches,
+          Math.max(1, Math.min(contentConcurrency, 3)),
+          (batch) => planBatch(batch),
+          isPauseRequested,
+        );
       }
     }
     pauseIfRequested('正文生成已在编排阶段暂停，可导出当前已完成内容，稍后继续。');
@@ -4049,18 +4539,46 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     if (restoreTargets.length) {
       const allowedNodeIds = new Set(restoreTargets.map(({ item }) => item.id).filter(Boolean));
       const allowedSourceIds = new Set(originalPlanSegments.map((segment) => segment.id));
-      const restoreMessages = buildOriginalMaterialRestoreMessages({
+      const autoAssignments = autoMatchOriginalSegmentsByTitle(restoreTargets, originalPlanSegments);
+      const autoAssignedSourceIds = new Set(autoAssignments.flatMap((assignment) => assignment.source_ids));
+      const unresolvedOriginalSegments = originalPlanSegments.filter((segment) => !autoAssignedSourceIds.has(segment.id));
+      const targetById = new Map(restoreTargets.map((context) => [context.item.id, context]));
+
+      for (const assignment of autoAssignments) {
+        const context = targetById.get(assignment.node_id);
+        const segments = assignment.source_ids.map((sourceId) => originalPlanSegmentById.get(sourceId)).filter(Boolean);
+        if (!context || !segments.length) continue;
+        segments.forEach((segment) => assignedSourceIds.add(segment.id));
+        const restoredContent = segments.map((segment) => segment.content).join('\n\n').trim();
+        const plan = getContentPlanForItem(context.item.id);
+        const originalMaterial = buildOriginalMaterialFromSegments(segments);
+        completedRestoreTargetIds.add(context.item.id);
+        contentStats.restoration_completed = completedRestoreTargetIds.size;
+        saveSectionAndContentPlan(context.item, { status: 'idle', content: restoredContent, error: undefined }, restoredContent, {
+          ...plan,
+          original_material: originalMaterial,
+        }, { logs });
+        restoredCount += 1;
+      }
+      logs = [...logs, autoAssignments.length
+        ? `原方案还原：已有 ${autoAssignments.length} 个原文段通过标题高度确定匹配，跳过模型映射；剩余 ${unresolvedOriginalSegments.length} 个原文段交给模型。`
+        : '原方案还原：未发现足够确定的标题匹配，进入模型映射。'];
+
+      if (!unresolvedOriginalSegments.length) {
+        contentStats.restoration_total = Math.max(contentStats.restoration_total, completedRestoreTargetIds.size);
+      } else {
+        const restoreMessages = buildOriginalMaterialRestoreMessages({
         targets: restoreTargets,
-        originalSegments: originalPlanSegments,
+        originalSegments: unresolvedOriginalSegments,
         projectOverview,
         bidAnalysisFactsText,
         globalFactTitlesText,
       });
       let result;
-      if (shouldUseAgentForMessages(aiService, restoreMessages)) {
+      if (getMessagesContentLength(restoreMessages) > getTextContextLengthLimit(aiService) * ORIGINAL_RESTORE_AGENT_THRESHOLD_RATIO) {
         const messagesLength = getMessagesContentLength(restoreMessages);
         const contextLengthLimit = getTextContextLengthLimit(aiService);
-        logs = [...logs, `原方案还原映射提示词 ${messagesLength} 字符，超过上下文阈值 ${Math.floor(contextLengthLimit * AGENT_CONTEXT_THRESHOLD_RATIO)}，切换 Agent 文件模式。`];
+        logs = [...logs, `原方案还原映射提示词 ${messagesLength} 字符，超过专用阈值 ${Math.floor(contextLengthLimit * ORIGINAL_RESTORE_AGENT_THRESHOLD_RATIO)}，切换 Agent 文件模式。`];
         writeDeveloperLog('original_restore.agent.start', {
           message_chars: messagesLength,
           context_length_limit: contextLengthLimit,
@@ -4076,7 +4594,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           outputFile: 'original-restore-result.json',
           files: buildAgentOriginalMaterialRestoreFiles({
             targets: restoreTargets,
-            originalSegments: originalPlanSegments,
+            originalSegments: unresolvedOriginalSegments,
             projectOverview,
             bidAnalysisFactsText,
             globalFactTitlesText,
@@ -4118,7 +4636,6 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         });
       }
 
-      const targetById = new Map(restoreTargets.map((context) => [context.item.id, context]));
       for (const assignment of result.assignments || []) {
         const context = targetById.get(assignment.node_id);
         if (!context) {
@@ -4139,6 +4656,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           original_material: originalMaterial,
         }, { logs });
         restoredCount += 1;
+      }
       }
     }
 
@@ -4184,6 +4702,193 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
   }
 
+
+  function buildContentGenerationBatchMessages(contexts) {
+    const sourceContexts = Array.isArray(contexts) ? contexts : [];
+    if (!sourceContexts.length) return [];
+
+    const first = sourceContexts[0];
+    const firstMessages = buildChapterContentMessages({
+      chapter: first.item,
+      projectOverview,
+      selectedFactsText: first.selectedFactsText,
+      tenderContextText: first.tenderContextText,
+      regenerateRequirement,
+      contentPlan: first.contentPlan,
+      knowledgeContents: first.knowledgeContents || [],
+      wordControl,
+      generationTarget: first.generationTarget || 0,
+      globalFactsMode,
+    });
+
+    const systemMessage = firstMessages.find((message) => message?.role === 'system');
+    const systemContent = String(systemMessage?.content || '')
+      .replace('只生成当前章节正文', '按下方各章节分别生成正文')
+      .replace('直接返回正文。', '最终只返回批量 JSON，不要输出其他文字。');
+
+    const commonMessages = [{
+      role: 'system',
+      content: systemContent || '你是投标技术方案正文编写助手，请按要求返回批量章节正文 JSON。',
+    }];
+
+    // 项目概述和本次重新生成要求对整个批次相同，只注入一次，避免每个 section 重复计费。
+    const commonProjectOverview = String(projectOverview || '').trim();
+    if (commonProjectOverview) {
+      commonMessages.push({
+        role: 'user',
+        content: '本批次共用项目概述信息：\n' + compactPromptText(commonProjectOverview, CONTENT_PROJECT_OVERVIEW_MAX_CHARS),
+      });
+    }
+    if (String(regenerateRequirement || '').trim()) {
+      commonMessages.push({
+        role: 'user',
+        content: '本批次共用的用户重新生成要求：\n' + regenerateRequirement,
+      });
+    }
+
+    const messages = [...commonMessages];
+    for (const context of sourceContexts) {
+      const individualMessages = buildChapterContentMessages({
+        chapter: context.item,
+        projectOverview,
+        selectedFactsText: context.selectedFactsText,
+        tenderContextText: context.tenderContextText,
+        regenerateRequirement,
+        contentPlan: context.contentPlan,
+        knowledgeContents: context.knowledgeContents || [],
+        wordControl,
+        generationTarget: context.generationTarget || 0,
+        globalFactsMode,
+      });
+      const sectionMessages = individualMessages.slice(1).filter((message) => {
+        const text = String(message?.content || '');
+        return !text.startsWith('项目概述信息：')
+          && !text.startsWith('用户对本次重新生成的额外要求：')
+          && !/^当前章节：/.test(text);
+      });
+      messages.push({
+        role: 'user',
+        content: '当前批量章节：' + (context.item.id || 'unknown') + ' ' + (context.item.title || '未命名章节') + '\n以下消息只针对本章节，生成结果必须写入该 section_id 对应的 content 字段。',
+      });
+      messages.push(...sectionMessages);
+    }
+
+    messages.push({
+      role: 'user',
+      content:
+        '请一次性完成以上 ' + sourceContexts.length + ' 个小节，并严格返回：\n' +
+        '{\n' +
+        '  "sections": [\n' +
+        '    {\n' +
+        '      "section_id": "1.1",\n' +
+        '      "content": "该小节完整正文，不包含章节标题、Markdown 标题、解释或总结"\n' +
+        '    }\n' +
+        '  ]\n' +
+        '}\n' +
+        '规则：\n' +
+        '1. sections 必须恰好覆盖本批次全部 section_id，不能遗漏、重复或新增。\n' +
+        '2. 每个 content 只包含对应小节正文，不得串入其他小节内容。\n' +
+        '3. 不要输出 Markdown 代码围栏或 JSON 之外的文字。\n' +
+        '4. 各小节事实、参数和承诺只使用该小节提供的上下文。',
+    });
+    return messages;
+  }
+
+  function normalizeContentGenerationBatchResponse(value, contexts) {
+    const source = value?.sections && Array.isArray(value.sections) ? value.sections : (Array.isArray(value) ? value : []);
+    const byId = new Map();
+    for (const raw of source) {
+      const id = singleLine(raw?.section_id || raw?.sectionId || raw?.node_id || raw?.nodeId);
+      if (id) byId.set(id, normalizeGeneratedMarkdown(raw?.content || raw?.text || ''));
+    }
+    return (contexts || []).map(({ item }) => ({
+      section_id: item.id,
+      content: byId.get(item.id) || '',
+    }));
+  }
+
+  function validateContentGenerationBatchResponse(value, contexts) {
+    if (!value || !Array.isArray(value)) {
+      throw new Error('正文批量生成结果必须是数组');
+    }
+    const allowedIds = new Set((contexts || []).map(({ item }) => item.id));
+    const seen = new Set();
+    for (const row of value) {
+      const id = singleLine(row?.section_id);
+      const content = String(row?.content || '').trim();
+      if (!id || !allowedIds.has(id) || seen.has(id)) {
+        throw new Error('正文批量生成结果 section_id 无效或重复：' + (id || '空'));
+      }
+      if (!content || countContentWords(content) === 0) {
+        throw new Error('正文批量生成结果内容为空：' + id);
+      }
+      seen.add(id);
+    }
+    if (seen.size !== allowedIds.size) {
+      throw new Error('正文批量生成结果缺少小节：期望 ' + allowedIds.size + '，实际 ' + seen.size);
+    }
+  }
+
+  async function runNormalContentBatch(contexts) {
+    const batch = (contexts || []).filter(Boolean);
+    if (!batch.length) return;
+    const preparedContexts = batch.map((context) => {
+      const item = context.item;
+      const contentPlan = getContentPlanForItem(item.id);
+      return {
+        ...context,
+        contentPlan,
+        knowledgeContents: resolveKnowledgeContents(contentPlan.knowledge?.item_ids, knowledgeContentMap),
+        selectedFactsText: resolveSelectedFactsText(contentPlan, globalFacts),
+        generationTarget: computeGenerationWordTarget(wordControl, leaves.length),
+        tenderContextText: getTenderContextForItem(item),
+      };
+    });
+    const batchId = 'content-generation-' + Date.now() + '-' + preparedContexts.map(({ item }) => item.id).join('-');
+
+    try {
+      logs = [...logs, '开始批量生成正文：' + preparedContexts.map(({ item }) => item.id).join('、') + '。'];
+      publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
+      const result = await aiService.collectJsonResponse({
+        messages: buildContentGenerationBatchMessages(preparedContexts),
+        logTitle: '正文批量生成-' + preparedContexts[0].item.id + '-' + preparedContexts[preparedContexts.length - 1].item.id,
+        progressLabel: '正文批量生成',
+        stage: 'content-generation',
+        batchId,
+        failureMessage: '模型返回的正文批量生成结果格式无效',
+        normalizer: (value) => normalizeContentGenerationBatchResponse(value, preparedContexts),
+        validator: (value) => validateContentGenerationBatchResponse(value, preparedContexts),
+        max_retries: 0,
+      });
+
+      const preparedResults = result.map((row) => {
+        const context = preparedContexts.find(({ item }) => item.id === row.section_id);
+        if (!context) throw new Error('批量生成结果包含未知小节：' + row.section_id);
+        const item = context.item;
+        const generatedContent = normalizeLeafContentForSave(row.content, item);
+        if (!generatedContent || countContentWords(generatedContent) === 0) {
+          throw new Error('批量生成小节无有效正文：' + item.id);
+        }
+        return { context, item, generatedContent };
+      });
+      for (const { item, generatedContent } of preparedResults) {
+        rememberTouchedItem(item.id);
+        markGenerationCompleted(item.id);
+        saveSection(item, { status: 'success', content: generatedContent, error: undefined }, generatedContent, { logs });
+        logs = [...logs, '批量生成完成：' + item.id + ' ' + (item.title || '未命名章节') + '。'];
+      }
+      pauseIfRequested('正文批量生成完成后暂停，可稍后继续。');
+      return;
+    } catch (error) {
+      if (isPauseLikeError(error)) throw error;
+      logs = [...logs, '正文批量生成未完成：' + preparedContexts.map(({ item }) => item.id).join('、') + '，' + (error.message || '未知错误') + '。回退为逐节生成。'];
+      publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
+      for (const context of batch) {
+        await runOne(context);
+      }
+    }
+  }
+
   async function runOne(context) {
     const { item } = context;
     const previousSection = sections[item.id] || {};
@@ -4217,9 +4922,10 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
       const knowledgeContents = resolveKnowledgeContents(contentPlan.knowledge?.item_ids, knowledgeContentMap);
       const selectedFactsText = resolveSelectedFactsText(contentPlan, globalFacts);
       const generationTarget = computeGenerationWordTarget(wordControl, leaves.length);
+      const tenderContextText = getTenderContextForItem(item);
       const contentMessages = needsRestoredOptimization
-        ? buildRestoredChapterContentMessages({ chapter: item, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent: previousContent, wordControl, generationTarget, globalFactsMode })
-        : buildChapterContentMessages({ chapter: item, projectOverview, selectedFactsText, regenerateRequirement, contentPlan, knowledgeContents, wordControl, generationTarget, globalFactsMode });
+        ? buildRestoredChapterContentMessages({ chapter: item, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, restoredContent: previousContent, wordControl, generationTarget, globalFactsMode })
+        : buildChapterContentMessages({ chapter: item, projectOverview, selectedFactsText, tenderContextText, regenerateRequirement, contentPlan, knowledgeContents, wordControl, generationTarget, globalFactsMode });
 
       let generatedContent;
       if (needsRestoredOptimization && shouldUseAgentForMessages(aiService, contentMessages)) {
@@ -4244,6 +4950,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
             chapter: item,
             projectOverview,
             selectedFactsText,
+            tenderContextText,
             regenerateRequirement,
             contentPlan,
             knowledgeContents,
@@ -4270,6 +4977,8 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
         generatedContent = await aiService.chat({
           messages: contentMessages,
           logTitle: `${needsRestoredOptimization ? '原方案优化扩写' : '正文生成'}-${item.id}-${item.title || '未命名章节'}`,
+          stage: 'content-generation',
+          sectionId: item.id,
         });
       }
 
@@ -4339,10 +5048,20 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     return '普通正文/无表格';
   }
 
+  function resolveContentGenerationBatchSize(groupTargets) {
+    const targets = Array.isArray(groupTargets) ? groupTargets : [];
+    if (!targets.length) return CONTENT_GENERATION_BATCH_SIZE;
+    const wordTargets = targets.map(({ item }) => computeGenerationWordTarget(wordControl, leaves.length, item));
+    const averageTarget = wordTargets.reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0) / Math.max(1, wordTargets.length);
+    const maximumTarget = Math.max(...wordTargets, 0);
+    if (maximumTarget >= 3500 || averageTarget >= 3200) return 2;
+    if (maximumTarget >= 2500 || averageTarget >= 2200) return 3;
+    if (maximumTarget >= 1500 || averageTarget >= 1200) return 4;
+    return 5;
+  }
+
   async function runContentTargetsWithWarmup(targets, label = '正文生成') {
-    if (!targets.length) {
-      return;
-    }
+    if (!targets.length) return;
 
     const groups = new Map();
     for (const context of targets) {
@@ -4352,36 +5071,48 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
       groups.set(key, group);
     }
 
-    const warmupContexts = new Set();
-    const warmups = [];
     for (const [key, groupTargets] of groups.entries()) {
-      if (groupTargets.length <= 1) {
+      const batchable = !targetItemId
+        && key.startsWith('normal:')
+        && groupTargets.length > 1;
+      const eligible = batchable
+        ? groupTargets.filter((context) => !simulatedFailureItemIds.has(context.item.id))
+        : [];
+      const batches = [];
+      const adaptiveBatchSize = batchable
+        ? resolveContentGenerationBatchSize(eligible)
+        : CONTENT_GENERATION_BATCH_SIZE;
+      if (batchable) {
+        for (let index = 0; index < eligible.length; index += adaptiveBatchSize) {
+          batches.push(eligible.slice(index, index + adaptiveBatchSize));
+        }
+      }
+
+      if (batches.length) {
+        const [warmupBatch, ...remainingBatches] = batches;
+        logs = [...logs, '开始' + label + '批量预热（' + formatContentPromptWarmupLabel(key) + '）：' + warmupBatch.map(({ item }) => item.id).join('、') + '；动态批次大小 ' + adaptiveBatchSize + '。'];
+        publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
+        await runNormalContentBatch(warmupBatch);
+        continueAfterPromptCacheWarmup(label + '批量预热完成，继续处理剩余 ' + remainingBatches.length + ' 个批次。');
+        if (remainingBatches.length) {
+          await runItemsWithWorkerPool(
+            remainingBatches,
+            Math.max(1, Math.min(contentConcurrency, remainingBatches.length)),
+            async (batch) => runNormalContentBatch(batch),
+            isPauseRequested,
+          );
+        }
+
+        const excluded = groupTargets.filter((context) => simulatedFailureItemIds.has(context.item.id));
+        if (excluded.length) {
+          await runItemsWithWorkerPool(excluded, contentConcurrency, runOne, isPauseRequested);
+        }
         continue;
       }
-      const context = groupTargets[0];
-      warmups.push({ key, context });
-      warmupContexts.add(context);
-    }
 
-    for (const { key, context } of warmups) {
-      logs = [...logs, `开始${label}预热（${formatContentPromptWarmupLabel(key)}）：${context.item.id} ${context.item.title || '未命名章节'}。`];
+      logs = [...logs, label + '开始逐节生成（' + formatContentPromptWarmupLabel(key) + '），共 ' + groupTargets.length + ' 个小节。'];
       publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
-
-      await runOne(context);
-      pauseIfRequested(`正文生成已在${label}预热后暂停，可导出当前已完成内容，稍后继续。`);
-    }
-
-    const remainingTargets = targets.filter((context) => !warmupContexts.has(context));
-
-    if (remainingTargets.length) {
-      if (warmups.length) {
-        continueAfterPromptCacheWarmup(`${label}分组预热完成，开始并发生成剩余 ${remainingTargets.length} 个小节。`);
-      }
-      logs = [...logs, warmups.length
-        ? `开始并发生成剩余 ${remainingTargets.length} 个小节。`
-        : `${label}无需分组预热，开始并发生成 ${remainingTargets.length} 个小节。`];
-      publishTaskUpdate({ status: 'running', progress: progressFor(leaves, sections), logs, stats: statsSnapshot() });
-      await runItemsWithWorkerPool(remainingTargets, contentConcurrency, runOne, isPauseRequested);
+      await runItemsWithWorkerPool(groupTargets, contentConcurrency, runOne, isPauseRequested);
     }
   }
 
@@ -4405,11 +5136,17 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     const currentContent = getLeafContentForWords(item);
     const currentWords = getLeafWordCount(item);
     const selectedFactsText = resolveSelectedFactsText(getContentPlanForItem(item.id), globalFacts);
+    const editableContent = selectEditableParagraphs(
+      currentContent,
+      `${item?.title || ''} ${item?.description || ''} ${selectedFactsText}`,
+      options.mode,
+      16000,
+    );
     pauseIfRequested('正文生成已在字数调整请求前暂停，继续后将重新执行本轮。');
     const adjustment = await aiService.collectJsonResponse({
       messages: buildWordAdjustmentMessages({
         context,
-        currentContent,
+        currentContent: editableContent || currentContent,
         currentWords,
         targetWords: options.targetWords,
         mode: options.mode,
@@ -4424,6 +5161,8 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
       }),
       logTitle: `正文${options.mode === 'expand' ? '扩写' : '缩写'}-${item.id}-${item.title || '未命名章节'}`,
       progressLabel: '正文字数调整',
+      stage: 'word-adjustment',
+      sectionId: item.id,
       failureMessage: '模型返回的正文字数调整结果格式无效',
       max_retries: 0,
       normalizer: normalizeWordAdjustmentResponse,
@@ -4433,7 +5172,7 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
           throw new Error('模型返回的调整方向或粒度与当前要求不一致');
         }
       },
-      repairMessagesBuilder: (repairContext) => buildWordAdjustmentRepairMessages(repairContext, options.mode, options.granularity, currentContent),
+      repairMessagesBuilder: (repairContext) => buildWordAdjustmentRepairMessages(repairContext, options.mode, options.granularity, editableContent || currentContent),
     });
     pauseIfRequested('正文生成已在字数调整结果应用前暂停，继续后将重新执行本轮。');
     const nextContent = normalizeLeafContentForSave(applyWordAdjustmentOperations(currentContent, adjustment), item);
@@ -4819,6 +5558,44 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
       .filter(({ item, originalState, sources }) => sections[item.id]?.status === 'success' && originalState.validRestored && !originalState.needsOptimization && sources.length);
   }
 
+  function selectOriginalCoverageAuditTargets(targets, options = {}) {
+    const source = Array.isArray(targets) ? targets : [];
+    if (!source.length) return [];
+    const normalizedTargetId = String(options.targetItemId || '').trim();
+    if (normalizedTargetId) return source.filter((target) => target.item.id === normalizedTargetId);
+
+    const mode = String(options.mode || 'risk-based').trim() || 'risk-based';
+    if (mode !== 'risk-based' || source.length <= 20) return source;
+
+    const ranked = source
+      .map((target, index) => {
+        const sourceText = (target.sources || []).map((segment) => segment.content || '').join('\n').slice(0, 7000);
+        const itemText = `${target.item?.title || ''}\n${target.item?.description || ''}\n${target.content || ''}`;
+        const score = (target.sources?.length || 0) * 4
+          + Math.min(12, Math.floor((target.content || '').length / 2500))
+          + (/(参数|型号|设备|人员|项目经理|工期|周期|验收|质保|售后|安全|应急|承诺)/.test(sourceText) ? 8 : 0)
+          + (/(参数|型号|设备|人员|项目经理|工期|周期|验收|质保|售后|安全|应急|承诺)/.test(itemText) ? 5 : 0);
+        return { target, index, score };
+      })
+      .sort((a, b) => b.score - a.score || a.index - b.index);
+
+    const targetCount = Math.min(
+      source.length,
+      Math.max(CONSISTENCY_RISK_AUDIT_MIN_COUNT, Math.ceil(source.length * CONSISTENCY_RISK_AUDIT_RATIO)),
+    );
+    const selected = ranked.slice(0, targetCount).map((entry) => entry.target);
+    const selectedIds = new Set(selected.map((target) => target.item.id));
+    const sampleStep = Math.max(1, Math.floor(ranked.length / 10));
+    for (let index = Math.floor(ranked.length / 2); index < ranked.length && selected.length < targetCount + 2; index += sampleStep) {
+      const target = ranked[index]?.target;
+      if (target && !selectedIds.has(target.item.id)) {
+        selected.push(target);
+        selectedIds.add(target.item.id);
+      }
+    }
+    return selected.slice(0, Math.min(source.length, targetCount + 2));
+  }
+
   function buildAgentOriginalCoverageSourcesMarkdown(targets) {
     const lines = ['# 原方案覆盖来源段', ''];
     for (const target of targets || []) {
@@ -4837,13 +5614,14 @@ async function runContentGenerationTask({ aiService, agentService, workspaceStor
     return `请在当前工作目录中完成原方案覆盖修复，让 technical-plan.md 成为程序可继续解析和回写的最终正文文件。
 
 workspace 文件说明：
-- original-coverage-sources.md：每个章节对应需要保留的来源段，是判断原方案核心内容是否已保留的依据。
-- technical-plan.md：当前技术方案正文，包含章节标题、section id 和 yibiao-section-start / yibiao-section-end 标记。
+- original-coverage-sources.md：原方案覆盖来源索引。
+- original-coverage-sources/section-*.md：每个目标小节对应的来源段，按需读取。
+- technical-plan.md：目标正文索引；完整正文位于 technical-plan/section-*.md。
 
 任务目标：
 检查并修复 technical-plan.md，使各章节正文尽量保留 original-coverage-sources.md 中对应来源段的实质内容。
 
-工作方式由你自行决定。可以搜索、分段读取、建立索引、创建草稿或中间文件，并多轮编辑 technical-plan.md；不需要按固定顺序读取文件，也不需要在单次模型输出中完成全部修复。
+工作方式由你自行决定。先阅读 technical-plan.md 索引中的风险信号和正文预览，只针对存在明显事实冲突风险的小节读取 technical-plan/section-*.md 的完整正文；不要为了确认无关小节而批量读取全部完整正文。可以搜索、分段读取、建立索引、创建草稿或中间文件，并多轮编辑 technical-plan.md；不需要在单次模型输出中完成全部修复。
 
 最终 technical-plan.md 需要满足：
 - 保留所有章节编号、章节标题、HTML 注释标记和 section id。
@@ -4912,10 +5690,12 @@ workspace 文件说明：
           }),
           logTitle: `原方案覆盖修复-${item.id}-${item.title || '未命名章节'}`,
           progressLabel: '原方案覆盖修复',
+          stage: 'original-coverage',
+          sectionId: item.id,
           failureMessage: '模型返回的原方案覆盖修复结果格式无效',
           normalizer: normalizeContentExpansionPatch,
           validator: validateContentExpansionPatch,
-          repairMessagesBuilder: (contextForRepair) => buildContentExpansionRepairMessages(contextForRepair, currentContent),
+          repairMessagesBuilder: (contextForRepair) => buildContentExpansionRepairMessages(contextForRepair, selectEditableParagraphs(currentContent, `${item?.title || ''} ${item?.description || ''} ${JSON.stringify(coverageItems || [])}`, 'expand', 16000) || currentContent),
           max_retries: 1,
         });
         writeDeveloperLog('original_coverage.repair.response', {
@@ -4987,7 +5767,12 @@ workspace 文件说明：
       return { ran: false, fixedCount: 0, failedCount: 0 };
     }
 
-    const coverageTargets = buildOriginalCoverageAuditTargets('');
+    const rawCoverageTargets = buildOriginalCoverageAuditTargets('');
+    const coverageTargets = selectOriginalCoverageAuditTargets(rawCoverageTargets, {
+      mode: generationOptions.originalPlanCoverageMode
+        || generationOptions.original_plan_coverage_mode
+        || 'risk-based',
+    });
     const sectionIndex = buildAgentConsistencySectionIndex(coverageTargets);
     if (!sectionIndex.size) {
       writeDeveloperLog('original_coverage.agent.skipped', { reason: 'no_targets' });
@@ -5017,8 +5802,8 @@ workspace 文件说明：
 
     updateAgentOriginalCoverageProgress(1, '准备原方案覆盖 Agent 输入文件');
     const files = [
-      { path: 'original-coverage-sources.md', content: buildAgentOriginalCoverageSourcesMarkdown(coverageTargets) },
-      { path: 'technical-plan.md', content: buildAgentTechnicalPlanMarkdown(sectionIndex) },
+      ...buildAgentOriginalCoverageSourceFiles(coverageTargets),
+      ...buildAgentTechnicalPlanFiles(sectionIndex),
     ];
     pauseIfRequested('正文生成已在原方案覆盖 Agent 修复开始前暂停，本次 Agent 未启动；继续后将重新执行。');
 
@@ -5153,7 +5938,15 @@ workspace 文件说明：
       return { ran: false, fixedCount: 0, failedCount: 0 };
     }
 
-    const auditTargets = buildOriginalCoverageAuditTargets(options.targetItemId || targetItemId);
+    const rawAuditTargets = buildOriginalCoverageAuditTargets(options.targetItemId || targetItemId);
+    const auditTargets = selectOriginalCoverageAuditTargets(rawAuditTargets, {
+      targetItemId: options.targetItemId || targetItemId,
+      mode: options.originalPlanCoverageMode
+        || options.original_plan_coverage_mode
+        || generationOptions.originalPlanCoverageMode
+        || generationOptions.original_plan_coverage_mode
+        || 'risk-based',
+    });
     if (!auditTargets.length) {
       writeDeveloperLog('original_coverage.audit.skipped', { reason: 'no_targets', target_item_id: options.targetItemId || targetItemId || '' });
       logs = [...logs, '原方案覆盖审计跳过：没有可审计的已还原成功正文小节。'];
@@ -5206,6 +5999,8 @@ workspace 文件说明：
         const response = await aiService.collectJsonResponse({
           messages: buildOriginalCoverageAuditMessages({ target }),
           logTitle: `原方案覆盖审计-${target.item.id}-${target.item.title || '未命名章节'}`,
+          stage: 'original-coverage',
+          sectionId: target.item.id,
           progressLabel: '原方案覆盖审计',
           failureMessage: '模型返回的原方案覆盖审计结果格式无效',
           normalizer: (value) => normalizeOriginalCoverageAuditResponse(value, { allowedSourceIds, expectedNodeId: target.item.id }),
@@ -5367,33 +6162,37 @@ workspace 文件说明：
   }
 
   function buildConsistencyAuditGroups(targets) {
-    const totalWords = (targets || []).reduce((sum, item) => sum + item.words, 0);
-    if (!targets?.length) {
-      return [];
-    }
-
-    let groupCount = 1;
-    if (totalWords > CONSISTENCY_AUDIT_GROUP_WORD_LIMIT) {
-      groupCount = 2;
-      while (totalWords / groupCount > CONSISTENCY_AUDIT_GROUP_WORD_LIMIT) {
-        groupCount += 1;
-      }
-    }
+    if (!targets?.length) return [];
+    const totalWords = targets.reduce((sum, item) => sum + item.words, 0);
+    const totalChars = targets.reduce((sum, item) => sum + Math.min(String(item.content || '').length, 3500), 0);
+    const wordGroups = Math.max(1, Math.ceil(totalWords / CONSISTENCY_AUDIT_GROUP_WORD_LIMIT));
+    const charGroups = Math.max(1, Math.ceil(totalChars / CONSISTENCY_AUDIT_GROUP_CHAR_LIMIT));
+    const groupCount = Math.max(1, wordGroups, charGroups);
     const targetWords = Math.max(1, Math.ceil(totalWords / groupCount));
+    const targetChars = Math.max(1, Math.ceil(totalChars / groupCount));
     const groups = [];
-    let current = { index: 1, items: [], words: 0, targetWords };
+    let current = { index: 1, items: [], words: 0, estimated_chars: 0, targetWords, targetChars };
 
     for (const target of targets) {
-      if (current.items.length && current.words + target.words > targetWords && groups.length < groupCount - 1) {
+      const estimatedChars = Math.min(String(target.content || '').length, 3500);
+      const wouldExceedWords = current.items.length && current.words + target.words > targetWords;
+      const wouldExceedChars = current.items.length && current.estimated_chars + estimatedChars > targetChars;
+      if ((wouldExceedWords || wouldExceedChars) && groups.length < groupCount - 1) {
         groups.push(current);
-        current = { index: groups.length + 1, items: [], words: 0, targetWords };
+        current = {
+          index: groups.length + 1,
+          items: [],
+          words: 0,
+          estimated_chars: 0,
+          targetWords,
+          targetChars,
+        };
       }
       current.items.push(target);
       current.words += target.words;
+      current.estimated_chars += estimatedChars;
     }
-    if (current.items.length) {
-      groups.push(current);
-    }
+    if (current.items.length) groups.push(current);
     return groups.map((group, index) => ({ ...group, index: index + 1, total: groups.length, totalWords }));
   }
 
@@ -5437,18 +6236,69 @@ workspace 文件说明：
     return lines;
   }
 
+  function buildAgentTechnicalPlanFiles(sectionIndex) {
+    const indexLines = [
+      '# 技术方案正文索引',
+      '',
+      '先阅读本索引中的风险信号和正文预览；只有需要核实或修改某个小节时，再读取对应 technical-plan/section-*.md。最终输出仍必须写入 technical-plan.md。',
+    ];
+    const files = [];
+    for (const [id, section] of sectionIndex.entries()) {
+      const safeId = String(id).replace(/[^A-Za-z0-9._-]/g, '_');
+      const path = `technical-plan/section-${safeId}.md`;
+      const risk = scoreConsistencyAuditRisk(section);
+      const preview = compactConsistencyAuditContent(section.originalContent, 1200).replace(/\n/g, ' ').slice(0, 900);
+      indexLines.push(`- ${id} ${singleLine(section.item?.title || '未命名章节')}：${path}；风险=${risk}；正文预览=${preview}`);
+      files.push({
+        path,
+        content: `<!-- yibiao-section-start id="${id}" -->
+${String(section.originalContent || '').trim()}
+<!-- yibiao-section-end id="${id}" -->`,
+      });
+    }
+    return [{ path: 'technical-plan.md', content: indexLines.join('\n') }, ...files];
+  }
+
+  function buildAgentOriginalCoverageSourceFiles(targets) {
+    const indexLines = [
+      '# 原方案覆盖来源索引',
+      '',
+      '先阅读来源段预览和风险提示；只有需要核实某个来源段时，再按索引读取对应来源文件。',
+    ];
+    const files = [];
+    for (const target of targets || []) {
+      const id = String(target.item?.id || 'unknown').replace(/[^A-Za-z0-9._-]/g, '_');
+      const path = `original-coverage-sources/section-${id}.md`;
+      const preview = formatOriginalCoverageSources(target.sources).replace(/\n/g, ' ').slice(0, 1800);
+      const risk = scoreConsistencyAuditRisk(target);
+      indexLines.push(`- ${target.item?.id || 'unknown'} ${singleLine(target.item?.title || '未命名章节')}：${path}；风险=${risk}；来源预览=${preview}`);
+      files.push({
+        path,
+        content: [
+          `# ${target.item?.id || 'unknown'} ${target.item?.title || '未命名章节'}`,
+          `章节路径：${formatChapterPath(target)}`,
+          '需要保留的来源段：',
+          formatOriginalCoverageSources(target.sources) || '未提供',
+        ].join('\n\n'),
+      });
+    }
+    return [{ path: 'original-coverage-sources.md', content: indexLines.join('\n') }, ...files];
+  }
+
   function buildAgentTechnicalPlanMarkdown(sectionIndex) {
     const lines = ['# 技术方案正文', ''];
     renderAgentTechnicalPlanOutline(outlineData.outline || [], sectionIndex, 1, lines);
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd();
   }
 
-  function buildAgentGlobalFactsMarkdown() {
+  function buildAgentGlobalFactsMarkdown(targets = []) {
+    const query = (targets || []).map((target) => `${target?.item?.title || ''} ${target?.item?.description || ''} ${String(target?.content || '').slice(0, 1200)}`).join('\n');
+    const relevantFacts = selectRelevantConsistencyFacts(globalFactsText, query, Math.min(CONSISTENCY_FACT_CONTEXT_MAX_CHARS, 4500));
     return [
-      '# 全局事实变量',
-      globalFactsText || '未提供',
-      '# Step02 关键解析结果',
-      bidAnalysisFactsText || '未提供',
+      '# 与本轮审计相关的全局事实变量',
+      relevantFacts || '未提供',
+      '# 与本轮审计相关的 Step02 关键解析结果',
+      compactPromptText(bidAnalysisFactsText, 2500),
     ].join('\n\n');
   }
 
@@ -5457,12 +6307,13 @@ workspace 文件说明：
 
 workspace 文件说明：
 - global-facts.md：全局事实变量、Step02 关键解析结果和需要保持一致的项目信息。
-- technical-plan.md：当前技术方案正文全文，包含章节标题、section id 和 yibiao-section-start / yibiao-section-end 标记。
+- technical-plan.md：目标正文索引；完整目标小节位于 technical-plan/section-*.md。
+- technical-plan/section-*.md：目标小节正文文件，按需读取。
 
 任务目标：
 审计并修复 technical-plan.md，使正文不与 global-facts.md 中的全局事实变量冲突，并尽量消除正文前后矛盾。
 
-工作方式由你自行决定。可以搜索、分段读取、建立索引、创建草稿或中间文件，并多轮编辑 technical-plan.md；不需要按固定顺序读取文件，也不需要在单次模型输出中完成全部修复。
+工作方式由你自行决定。先阅读 original-coverage-sources.md 中的来源预览和风险提示，只针对需要补回的信息读取对应 original-coverage-sources/section-*.md；不要为了确认无关来源而批量读取全部来源文件。可以搜索、分段读取、建立索引、创建草稿或中间文件，并多轮编辑 technical-plan.md；不需要在单次模型输出中完成全部修复。
 
 最终 technical-plan.md 需要满足：
 - 保留所有章节编号、章节标题、HTML 注释标记和 section id。
@@ -5538,7 +6389,18 @@ workspace 文件说明：
       throw new Error('Agent 服务尚未初始化，无法执行 Agent 一致性修复');
     }
 
-    const allTargets = buildConsistencyAuditTargets('');
+    const rawAgentTargets = buildConsistencyAuditTargets('');
+    const normalizedTargetId = String(options.targetItemId || targetItemId || '').trim();
+    const requestedAgentAuditMode = String(
+      options.consistencyAuditMode
+      || options.consistency_audit_mode
+      || generationOptions.consistencyAuditMode
+      || generationOptions.consistency_audit_mode
+      || 'risk-based'
+    ).trim() || 'risk-based';
+    const allTargets = normalizedTargetId
+      ? rawAgentTargets
+      : selectConsistencyAuditTargets(rawAgentTargets, { mode: requestedAgentAuditMode });
     const sectionIndex = buildAgentConsistencySectionIndex(allTargets);
     if (!sectionIndex.size) {
       writeDeveloperLog('consistency.agent.skipped', { reason: 'no_targets', target_item_id: options.targetItemId || targetItemId || '' });
@@ -5547,7 +6409,6 @@ workspace 文件说明：
       return { ran: false, fixedCount: 0, failedCount: 0 };
     }
 
-    const normalizedTargetId = String(options.targetItemId || targetItemId || '').trim();
     const writableIds = normalizedTargetId ? new Set([normalizedTargetId]) : new Set(sectionIndex.keys());
     if (normalizedTargetId && !sectionIndex.has(normalizedTargetId)) {
       logs = [...logs, `Agent 一致性修复跳过：目标小节 ${normalizedTargetId} 当前没有成功正文。`];
@@ -5563,7 +6424,7 @@ workspace 文件说明：
     contentStats.audit_fix_failed = 0;
     contentStats.audit_agent_changed_sections = 0;
     contentStats.audit_agent_failed_sections = 0;
-    logs = [...logs, `开始 Agent 全文一致性修复：共 ${sectionIndex.size} 个正文小节${normalizedTargetId ? `，仅回写目标小节 ${normalizedTargetId}` : ''}。`];
+    logs = [...logs, `开始 Agent 一致性修复：原始 ${rawAgentTargets.length} 个成功小节，按 ${normalizedTargetId ? '单小节' : requestedAgentAuditMode} 筛选后实际处理 ${sectionIndex.size} 个小节${normalizedTargetId ? `，仅回写目标小节 ${normalizedTargetId}` : ''}。`];
     writeDeveloperLog('consistency.agent.start', {
       target_item_id: normalizedTargetId,
       section_count: sectionIndex.size,
@@ -5577,8 +6438,8 @@ workspace 文件说明：
 
     updateAgentConsistencyProgress(1, '准备 Agent 输入文件');
     const files = [
-      { path: 'global-facts.md', content: buildAgentGlobalFactsMarkdown() },
-      { path: 'technical-plan.md', content: buildAgentTechnicalPlanMarkdown(sectionIndex) },
+      { path: 'global-facts.md', content: buildAgentGlobalFactsMarkdown(allTargets) },
+      ...buildAgentTechnicalPlanFiles(sectionIndex),
     ];
     pauseIfRequested('正文生成已在 Agent 全文一致性修复开始前暂停，本次 Agent 未启动；继续后将重新执行 Agent 修复。');
 
@@ -5831,7 +6692,17 @@ workspace 文件说明：
       return { ran: false, fixedCount: 0, failedCount: 0 };
     }
 
-    const auditTargets = buildConsistencyAuditTargets(options.targetItemId || targetItemId);
+    const rawAuditTargets = buildConsistencyAuditTargets(options.targetItemId || targetItemId);
+    const auditMode = String(
+      options.consistencyAuditMode
+      || options.consistency_audit_mode
+      || generationOptions.consistencyAuditMode
+      || generationOptions.consistency_audit_mode
+      || 'risk-based'
+    ).trim() || 'risk-based';
+    const auditTargets = selectConsistencyAuditTargets(rawAuditTargets, {
+      mode: (options.targetItemId || targetItemId) ? 'full' : auditMode,
+    });
     if (!auditTargets.length) {
       writeDeveloperLog('consistency.audit.skipped', { reason: 'no_targets', target_item_id: options.targetItemId || targetItemId || '' });
       logs = [...logs, '全文一致性审计跳过：没有可审计的成功正文小节。'];
@@ -5857,7 +6728,7 @@ workspace 文件说明：
     contentStats.audit_agent_step_label = '';
     contentStats.audit_agent_changed_sections = 0;
     contentStats.audit_agent_failed_sections = 0;
-    logs = [...logs, `开始全文一致性审计：${auditTargets.length} 个小节，拆分为 ${auditGroups.length} 组，并发 ${contentConcurrency}。`];
+    logs = [...logs, `开始全文一致性审计：原始 ${rawAuditTargets.length} 个小节，实际审计 ${auditTargets.length} 个小节，模式 ${auditMode}，拆分为 ${auditGroups.length} 组，并发 ${contentConcurrency}。`];
     const auditRuntime = syncRuntime({ phase: 'auditing' });
     writeDeveloperLog('consistency.audit.start', {
       target_item_id: options.targetItemId || targetItemId || '',
@@ -5895,6 +6766,8 @@ workspace 文件说明：
         const response = await aiService.collectJsonResponse({
           messages: buildConsistencyAuditMessages({ group, globalFactsText, bidAnalysisFactsText, globalFactsMode }),
           logTitle: `一致性审计-${group.index}-${group.total}`,
+          stage: 'consistency',
+          batchId: `consistency-${group.index}-${group.total}`,
           progressLabel: '全文一致性审计',
           failureMessage: '模型返回的一致性审计结果格式无效',
           normalizer: (value) => normalizeConsistencyAuditResponse(value, allowedIds),

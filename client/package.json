@@ -19,7 +19,8 @@
     "prepare-openxml-helper": "node scripts/prepare-openxml-helper.cjs",
     "verify-agent-tools": "node scripts/verify-agent-tools.cjs",
     "smoke:electron-native": "electron scripts/electron-native-smoke.cjs",
-    "start": "electron ."
+    "start": "electron .",
+    "test:token": "node electron/services/tokenUsageLedger.test.cjs && node electron/services/tenderContextRetriever.test.cjs"
   },
   "build": {
     "appId": "com.yibiao.openbidkit",
